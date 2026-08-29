@@ -1,0 +1,16 @@
+[package]
+name = "ggg-rs-derive"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+darling = "0.24.1"
+quote = "1"
+syn = "3"
+
+[dev-dependencies]
+ndarray = "0.17.2"
+trybuild = "1.0.120"

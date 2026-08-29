@@ -1,0 +1,5 @@
+error: `skip` cannot be combined with `kind` or `axis`
+ --> tests/ui/skip_with_kind.rs:6:5
+  |
+6 |     values: Vec<u8>,
+  |     ^^^^^^

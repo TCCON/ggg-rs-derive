@@ -1,0 +1,5 @@
+error: unknown kind "tensor", expected "vec" or "array"
+ --> tests/ui/unknown_kind.rs:6:5
+  |
+6 |     thing: Vec<u8>,
+  |     ^^^^^
