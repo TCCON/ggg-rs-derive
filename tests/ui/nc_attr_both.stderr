@@ -1,0 +1,5 @@
+error: `attr(...)` cannot set both `value` and `func`
+  --> tests/ui/nc_attr_both.rs:10:5
+   |
+10 |     values: Vec<f64>,
+   |     ^^^^^^

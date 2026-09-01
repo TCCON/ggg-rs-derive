@@ -1,6 +1,7 @@
 use proc_macro::TokenStream;
 
 mod subset;
+mod write_netcdf;
 
 /// Adds a `.subset(&[usize])` method to a struct to subset [`Vec`] or ndarray Array fields by indices.
 ///
@@ -106,4 +107,89 @@ mod subset;
 #[proc_macro_derive(Subset, attributes(subset))]
 pub fn derive_subset(input: TokenStream) -> TokenStream {
     subset::expand(input)
+}
+
+/// Adds a `write_netcdf` method that writes a struct's fields to a netCDF file.
+///
+/// The generated method has the signature
+///
+/// ```ignore
+/// pub fn write_netcdf(&self, grp: &mut netcdf::GroupMut<'_>) -> netcdf::Result<()>
+/// ```
+///
+/// It writes each field as a netCDF *variable* (or a *group attribute*) into the
+/// given group. Pass the file root — `file.root_mut().unwrap()` — to write at
+/// the top level, or a subgroup from `file.add_group(...)`. Any dimension named
+/// by a field that does not yet exist in the file is created automatically,
+/// sized from that field's length/shape.
+///
+/// By default the write strategy is inferred from each field's type:
+/// `ndarray` `Array*` fields use [`netcdf::VariableMut::put`], `Vec`/slice fields
+/// use [`netcdf::VariableMut::put_values`], `String`/`Vec<String>` fields use
+/// [`netcdf::VariableMut::put_string`], and remaining scalars use
+/// `put_value`. Variables are named after their fields unless renamed.
+///
+/// ```no_run
+/// use ggg_rs_derive::WriteNetcdf;
+/// use ndarray::Array2;
+///
+/// #[derive(WriteNetcdf)]
+/// #[netcdf(rename_all = "snake_case")]
+/// struct Data {
+///     // 1-D data sharing the "time" dimension (created on first use).
+///     #[netcdf(dimensions("time"))]
+///     xco2: Vec<f64>,
+///
+///     // 2-D array; dimensions map to axes in order.
+///     #[netcdf(dimensions("time", "level"))]
+///     prior_profile: Array2<f64>,
+///
+///     // A per-observation string is written with put_string.
+///     #[netcdf(dimensions("time"))]
+///     spectrum_name: Vec<String>,
+/// }
+///
+/// # fn main() -> netcdf::Result<()> {
+/// let data = Data {
+///     xco2: vec![400.0, 401.0],
+///     prior_profile: Array2::zeros((2, 3)),
+///     spectrum_name: vec!["pa2004".into(), "pa2005".into()],
+/// };
+/// let mut file = netcdf::create("out.nc")?;
+/// let mut root = file.root_mut().unwrap();
+/// data.write_netcdf(&mut root)?;
+/// # Ok(()) }
+/// ```
+///
+/// # Container attributes
+///
+/// - `#[netcdf(rename_all = "...")]` — apply a serde-style case convention
+///   (`snake_case`, `SCREAMING_SNAKE_CASE`, `kebab-case`, `camelCase`,
+///   `PascalCase`, `lowercase`, `UPPERCASE`, `SCREAMING-KEBAB-CASE`) to every
+///   field's netCDF name.
+///
+/// # Field attributes
+///
+/// - `#[netcdf(rename = "name")]` — set an explicit variable/attribute name
+///   (overrides `rename_all`).
+/// - `#[netcdf(dimensions("d0", "d1", ...))]` — dimension names in axis order,
+///   auto-created if absent.
+/// - `#[netcdf(kind = "values" | "array" | "string")]` — force the write
+///   strategy (needed for type aliases, or whenever `map`/`map_units` is used).
+/// - `#[netcdf(skip)]` — do not write this field.
+/// - `#[netcdf(attribute)]` — write the field as a *group attribute* rather than
+///   a variable.
+/// - `#[netcdf(attr(name = "units", value = "K"))]` — attach a constant attribute
+///   to the variable (repeatable). Use `attr(name = "...", func = path::to::fn)`
+///   to compute it via `fn(&Self, &FieldTy, &str) -> V` (`V: Into<AttributeValue>`).
+/// - `#[netcdf(map = path::to::fn)]` — transform the value before writing with
+///   `fn(&Self, &FieldTy, &str) -> Out`.
+/// - `#[netcdf(map_units = path::to::fn)]` — like `map`, but the function returns
+///   `(Out, String)` and the returned string is written as the `units` attribute.
+///
+/// The three-argument hooks receive the whole struct, a reference to the field
+/// value, and the field's netCDF name, so a mapping can depend on sibling fields.
+#[proc_macro_derive(WriteNetcdf, attributes(netcdf))]
+pub fn derive_write_netcdf(input: TokenStream) -> TokenStream {
+    write_netcdf::expand(input)
 }

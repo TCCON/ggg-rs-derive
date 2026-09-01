@@ -1,0 +1,7 @@
+error: unknown rename_all rule "TitleCase"
+ --> tests/ui/nc_unknown_rename_all.rs:3:10
+  |
+3 | #[derive(WriteNetcdf)]
+  |          ^^^^^^^^^^^
+  |
+  = note: this error originates in the derive macro `WriteNetcdf` (in Nightly builds, run with -Z macro-backtrace for more info)

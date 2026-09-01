@@ -1,0 +1,5 @@
+error: `map`/`map_units` requires an explicit `kind = "values"|"array"|"string"`
+  --> tests/ui/nc_map_without_kind.rs:10:5
+   |
+10 |     values: Vec<f64>,
+   |     ^^^^^^

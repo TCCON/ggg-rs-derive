@@ -1,0 +1,5 @@
+error: `skip` cannot be combined with any other `netcdf` option
+ --> tests/ui/nc_skip_with_other.rs:6:5
+  |
+6 |     values: Vec<f64>,
+  |     ^^^^^^

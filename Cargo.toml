@@ -8,9 +8,12 @@ proc-macro = true
 
 [dependencies]
 darling = "0.24.1"
+proc-macro2 = "1"
 quote = "1"
 syn = "3"
 
 [dev-dependencies]
 ndarray = "0.17.2"
+netcdf = "0.12.1"
+tempfile = "3"
 trybuild = "1.0.120"
