@@ -27,10 +27,65 @@ struct SubsetInput {
     data: ast::Data<darling::util::Ignored, SubsetField>,
 }
 
+enum ValueKind {
+    Vec,
+    NdArray { axis: usize },
+}
+
 enum FieldKind {
     Vec,
     NdArray { axis: usize },
+    HashMap { value: ValueKind },
     Skip,
+}
+
+/// Given a `Vec<T>` or `Array*<T>` type, classify it. Reused for both
+/// top-level fields and HashMap values.
+fn classify_container(
+    ty: &Type,
+    explicit_kind: Option<&str>,
+    explicit_axis: Option<usize>,
+) -> Result<ValueKind, darling::Error> {
+    if let Some(kind) = explicit_kind {
+        return match kind {
+            "vec" => Ok(ValueKind::Vec),
+            "array" => Ok(ValueKind::NdArray {
+                axis: explicit_axis.unwrap_or(0),
+            }),
+            other => Err(darling::Error::custom(format!("unknown kind \"{other}\""))),
+        };
+    }
+    if let Type::Path(type_path) = ty {
+        if let Some(seg) = type_path.path.segments.last() {
+            let ident = seg.ident.to_string();
+            if ident == "Vec" {
+                return Ok(ValueKind::Vec);
+            }
+            if ident.starts_with("Array") {
+                return Ok(ValueKind::NdArray {
+                    axis: explicit_axis.unwrap_or(0),
+                });
+            }
+        }
+    }
+    Err(darling::Error::custom("couldn't infer container kind"))
+}
+
+/// Extract the `V` type param out of `HashMap<K, V>`.
+fn hashmap_value_type(ty: &Type) -> Option<&Type> {
+    if let Type::Path(type_path) = ty {
+        let seg = type_path.path.segments.last()?;
+        if seg.ident != "HashMap" {
+            return None;
+        }
+        if let syn::PathArguments::AngleBracketed(args) = &seg.arguments {
+            // args: [K, V] — value is the second generic argument.
+            if let Some(syn::GenericArgument::Type(v_ty)) = args.args.iter().nth(1) {
+                return Some(v_ty);
+            }
+        }
+    }
+    None
 }
 
 fn resolve_kind(f: &SubsetField) -> Result<FieldKind, darling::Error> {
@@ -65,6 +120,13 @@ fn resolve_kind(f: &SubsetField) -> Result<FieldKind, darling::Error> {
             ))
             .with_span(ident)),
         };
+    }
+
+    // Handle HashMaps of vecs/arrays
+    if let Some(value_ty) = hashmap_value_type(&f.ty) {
+        let value_kind = classify_container(value_ty, f.kind.as_deref(), f.axis)
+            .map_err(|e| e.with_span(ident))?;
+        return Ok(FieldKind::HashMap { value: value_kind });
     }
 
     // Fallback: infer from the type's last path segment.
@@ -214,6 +276,9 @@ pub fn derive_subset(input: TokenStream) -> TokenStream {
     let mut vec_idents = Vec::new();
     let mut array_idents = Vec::new();
     let mut array_axes = Vec::new();
+    let mut hashmap_vec_idents = Vec::new();
+    let mut hashmap_array_idents = Vec::new();
+    let mut hashmap_array_axes = Vec::new();
     let mut skip_idents = Vec::new();
     let mut errors = darling::Error::accumulator();
 
@@ -225,6 +290,15 @@ pub fn derive_subset(input: TokenStream) -> TokenStream {
                 FieldKind::NdArray { axis } => {
                     array_idents.push(ident);
                     array_axes.push(axis);
+                }
+                FieldKind::HashMap {
+                    value: ValueKind::Vec,
+                } => hashmap_vec_idents.push(ident),
+                FieldKind::HashMap {
+                    value: ValueKind::NdArray { axis },
+                } => {
+                    hashmap_array_idents.push(ident);
+                    hashmap_array_axes.push(axis);
                 }
                 FieldKind::Skip => skip_idents.push(ident),
             }
@@ -253,6 +327,24 @@ pub fn derive_subset(input: TokenStream) -> TokenStream {
                     )*
                     #(
                         #array_idents: self.#array_idents.select(::ndarray::Axis(#array_axes), indices),
+                    )*
+                    #(
+                        #hashmap_vec_idents: self.#hashmap_vec_idents
+                            .iter()
+                            .map(|(k, v)| (
+                                k.clone(),
+                                indices.iter().map(|&i| v[i].clone()).collect(),
+                            ))
+                            .collect(),
+                    )*
+                    #(
+                        #hashmap_array_idents: self.#hashmap_array_idents
+                            .iter()
+                            .map(|(k, v)| (
+                                k.clone(),
+                                v.select(::ndarray::Axis(#hashmap_array_axes), indices),
+                            ))
+                            .collect(),
                     )*
                     #(
                         #skip_idents: self.#skip_idents.clone(),

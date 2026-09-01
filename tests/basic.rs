@@ -1,5 +1,3 @@
-use std::assert_eq;
-
 use ggg_rs_derive::Subset;
 use ndarray::{Array1, Array2, array};
 
