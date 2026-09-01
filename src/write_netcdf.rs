@@ -295,7 +295,9 @@ fn resolve_field(f: &WriteNetcdfField) -> Result<WriteKind, darling::Error> {
             || f.describe.is_some()
             || f.no_describe
         {
-            return Err(err("`skip` cannot be combined with any other `netcdf` option"));
+            return Err(err(
+                "`skip` cannot be combined with any other `netcdf` option",
+            ));
         }
         return Ok(WriteKind::Skip);
     }
@@ -422,10 +424,7 @@ fn apply_rename_all(field: &str, rule: &str) -> Result<String, darling::Error> {
 
 /// Resolve a field's final netCDF name: `rename` wins, then `rename_all`, then
 /// the raw field name.
-fn nc_name(
-    f: &WriteNetcdfField,
-    rename_all: Option<&str>,
-) -> Result<String, darling::Error> {
+fn nc_name(f: &WriteNetcdfField, rename_all: Option<&str>) -> Result<String, darling::Error> {
     if let Some(name) = &f.rename {
         return Ok(name.clone());
     }
@@ -545,6 +544,7 @@ impl HelpersNeeded {
                 {
                     if g.dimension(name).is_none() {
                         g.add_dimension(name, len)?;
+                        log::trace!("Created dimension {name} with length {len}");
                     }
                     Ok(())
                 }
@@ -570,6 +570,7 @@ impl HelpersNeeded {
                 fn __put_values<'g, T: ::netcdf::NcTypeDescriptor>(
                     g: &'g mut ::netcdf::GroupMut<'_>, name: &str, dims: &[&str], vals: &[T],
                 ) -> ::netcdf::Result<::netcdf::VariableMut<'g>> {
+                    log::trace!("Writing to variable '{name}' with __put_values");
                     let mut v = g.add_variable::<T>(name, dims)?;
                     v.put_values(vals, ..)?;
                     Ok(v)
@@ -582,6 +583,13 @@ impl HelpersNeeded {
                     g: &'g mut ::netcdf::GroupMut<'_>, name: &str, dims: &[&str],
                     arr: ::ndarray::ArrayView<'_, T, D>,
                 ) -> ::netcdf::Result<::netcdf::VariableMut<'g>> {
+                    if dims.len() != arr.ndim() {
+                        return Err(netcdf::Error::Str(format!(
+                            "{} dimension(s) were defined for variable {}, but the array has {} dimension(s)",
+                            dims.len(), name, arr.ndim()
+                        )))
+                    }
+                    log::trace!("Writing to variable '{name}' with __put_array");
                     let mut v = g.add_variable::<T>(name, dims)?;
                     v.put(arr, ..)?;
                     Ok(v)
@@ -594,6 +602,7 @@ impl HelpersNeeded {
                 fn __put_strings<'g>(
                     g: &'g mut ::netcdf::GroupMut<'_>, name: &str, dims: &[&str], vals: &[String],
                 ) -> ::netcdf::Result<::netcdf::VariableMut<'g>> {
+                    log::trace!("Writing to variable '{name}' with __put_strings");
                     let mut v = g.add_string_variable(name, dims)?;
                     for (i, s) in vals.iter().enumerate() {
                         v.put_string(s, [i])?;
@@ -607,6 +616,7 @@ impl HelpersNeeded {
                 fn __put_scalar<'g, T: ::netcdf::NcTypeDescriptor>(
                     g: &'g mut ::netcdf::GroupMut<'_>, name: &str, val: T,
                 ) -> ::netcdf::Result<::netcdf::VariableMut<'g>> {
+                    log::trace!("Writing to variable '{name}' with __put_scalar");
                     let mut v = g.add_variable::<T>(name, &[])?;
                     v.put_value(val, ())?;
                     Ok(v)
@@ -618,6 +628,7 @@ impl HelpersNeeded {
                 fn __put_string_scalar<'g>(
                     g: &'g mut ::netcdf::GroupMut<'_>, name: &str, s: &str,
                 ) -> ::netcdf::Result<::netcdf::VariableMut<'g>> {
+                    log::trace!("Writing to variable '{name}' with __put_string_scalar");
                     let mut v = g.add_string_variable(name, &[])?;
                     v.put_string(s, ())?;
                     Ok(v)
@@ -646,7 +657,10 @@ fn field_block(
     // `prelude` computes the value to write; `place` names it afterwards.
     // Without a map we operate directly on `self.<field>`.
     let (prelude, place): (TokenStream2, TokenStream2) = if let Some(m) = &f.map {
-        (quote! { let __val = #m(self, &self.#ident, #name); }, quote!(__val))
+        (
+            quote! { let __val = #m(self, &self.#ident, #name); },
+            quote!(__val),
+        )
     } else if let Some(m) = &f.map_units {
         (
             quote! { let (__val, __units) = #m(self, &self.#ident, #name); },
@@ -685,19 +699,29 @@ fn field_block(
     let needs_var = !attr_stmts.is_empty();
 
     // The dimension-name list literal (`["time", "level"]`), if given explicitly.
-    let dim_names: Vec<String> = f.dimensions.as_ref().map(|d| d.0.clone()).unwrap_or_default();
+    let dim_names: Vec<String> = f
+        .dimensions
+        .as_ref()
+        .map(|d| d.0.clone())
+        .unwrap_or_default();
 
     // Produce the `helper(...)` call that creates + writes the variable.
     let call: TokenStream2 = match wk {
         WriteKind::Values => {
-            let d0 = dim_names.first().cloned().unwrap_or_else(|| name.to_string());
+            let d0 = dim_names
+                .first()
+                .cloned()
+                .unwrap_or_else(|| name.to_string());
             quote! {{
                 __ensure_dim(grp, #d0, #place.len())?;
                 __put_values(grp, #name, &[#d0], & #place)
             }}
         }
         WriteKind::StringVec => {
-            let d0 = dim_names.first().cloned().unwrap_or_else(|| name.to_string());
+            let d0 = dim_names
+                .first()
+                .cloned()
+                .unwrap_or_else(|| name.to_string());
             quote! {{
                 __ensure_dim(grp, #d0, #place.len())?;
                 __put_strings(grp, #name, &[#d0], & #place)

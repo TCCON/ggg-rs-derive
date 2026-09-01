@@ -281,8 +281,49 @@ fn writes_doc_comments_as_description_attributes() {
     );
 
     // `no_describe` opts the field out entirely.
-    assert!(file.variable("counter").unwrap().attribute("long_name").is_none());
+    assert!(
+        file.variable("counter")
+            .unwrap()
+            .attribute("long_name")
+            .is_none()
+    );
 
     // No doc comment => no description attribute.
-    assert!(file.variable("plain").unwrap().attribute("long_name").is_none());
+    assert!(
+        file.variable("plain")
+            .unwrap()
+            .attribute("long_name")
+            .is_none()
+    );
+}
+
+#[derive(WriteNetcdf)]
+struct BadDimDef {
+    #[netcdf(dimensions("time"))]
+    arr: Array2<i64>,
+}
+
+#[test]
+fn test_bad_dim_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("described.nc");
+
+    let mut file = netcdf::create(&path).unwrap();
+    let mut root = file.root_mut().unwrap();
+    let res = BadDimDef {
+        arr: array![[1, 2], [3, 4]],
+    }
+    .write_netcdf(&mut root);
+
+    if let Err(netcdf::Error::Str(msg)) = res {
+        assert_eq!(
+            msg,
+            "1 dimension(s) were defined for variable arr, but the array has 2 dimension(s)"
+        );
+    } else {
+        assert!(
+            false,
+            "Expected Err(netcdf::Error::Str) from call to write_netcdf(), got: {res:?}"
+        );
+    }
 }
