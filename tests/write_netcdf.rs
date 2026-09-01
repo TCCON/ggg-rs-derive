@@ -232,7 +232,8 @@ struct Described {
     #[netcdf(dimensions("time"))]
     xco2: Vec<f64>,
 
-    /// Surface pressure
+    /// Surface pressure.
+    /// Will be in Pascals.
     #[netcdf(dimensions("time"), describe = "comment")]
     psurf: Vec<f64>,
 
@@ -273,11 +274,12 @@ fn writes_doc_comments_as_description_attributes() {
     );
 
     // Field overrides the attribute name to "comment" (and drops "long_name").
+    // Also test that multiline descriptions are wrapped appropriately.
     let psurf = file.variable("psurf").unwrap();
     assert!(psurf.attribute("long_name").is_none());
     assert_eq!(
         psurf.attribute("comment").unwrap().value().unwrap(),
-        netcdf::AttributeValue::Str("Surface pressure".to_string())
+        netcdf::AttributeValue::Str("Surface pressure. Will be in Pascals.".to_string())
     );
 
     // `no_describe` opts the field out entirely.

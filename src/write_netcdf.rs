@@ -461,7 +461,7 @@ fn extract_doc(attrs: &[syn::Attribute]) -> Option<String> {
             }
         }
     }
-    let text = lines.join("\n");
+    let text = lines.join(" ");
     let trimmed = text.trim();
     if trimmed.is_empty() {
         None
