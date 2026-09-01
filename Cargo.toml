@@ -13,6 +13,7 @@ quote = "1"
 syn = "3"
 
 [dev-dependencies]
+chrono = "0.4"       # used in examples
 ndarray = "0.17.2"
 netcdf = "0.12.1"
 tempfile = "3"

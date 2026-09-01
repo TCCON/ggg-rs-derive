@@ -6,7 +6,10 @@ use ndarray::{Array2, array};
 
 /// `map_units` hook: convert a fraction to ppm and report the units string.
 fn frac_to_ppm(_data: &Data, values: &Vec<f64>, _name: &str) -> (Vec<f64>, String) {
-    (values.iter().map(|v| v * 1.0e6).collect(), "ppm".to_string())
+    (
+        values.iter().map(|v| v * 1.0e6).collect(),
+        "ppm".to_string(),
+    )
 }
 
 /// `attr(func = ...)` hook: build a long_name from the field's netCDF name.
@@ -58,6 +61,18 @@ fn sample() -> Data {
         xluft: vec![1.0e-6, 2.0e-6],
         source: "unit-test".to_string(),
         n_obs: 2,
+        _cache: vec![0, 1, 2],
+    }
+}
+
+fn sample2() -> Data {
+    Data {
+        xco2: vec![400.0, 401.0, 402.0],
+        prior_profile: array![[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]],
+        spectrum: vec!["oc2004".to_string(), "oc2005".to_string()],
+        xluft: vec![1.0e-6, 2.0e-6],
+        source: "unit-test".to_string(),
+        n_obs: 3,
         _cache: vec![0, 1, 2],
     }
 }
@@ -145,7 +160,10 @@ fn writes_into_a_subgroup() {
     let grp = file.group("site_pa").unwrap().unwrap();
     assert_eq!(grp.dimension("time").unwrap().len(), 2);
     assert_eq!(
-        grp.variable("xco2").unwrap().get_values::<f64, _>(..).unwrap(),
+        grp.variable("xco2")
+            .unwrap()
+            .get_values::<f64, _>(..)
+            .unwrap(),
         vec![400.0, 401.0]
     );
     assert_eq!(
@@ -154,4 +172,53 @@ fn writes_into_a_subgroup() {
     );
     // The root has no variables — everything went into the group.
     assert!(file.variable("xco2").is_none());
+}
+
+#[test]
+fn test_dim_inheritance() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("group.nc");
+
+    let mut file = netcdf::create(&path).unwrap();
+    // Create the time dimension in the root group to test how
+    // the macro handles inheritance.
+    file.add_dimension("time", 42).unwrap();
+    let mut grp = file.add_group("site_pa").unwrap();
+    let res = sample().write_netcdf(&mut grp);
+    // It's surprisingly hard to test whether a dimension retrieved with .dimension(...) is from
+    // the root or a group - even if it ultimately resolves to the same dimension, the returned
+    // `Dimension` has a different identifier and even if it is in a group, the .name() method
+    // just returns the plain name, not the path. The best I could do is put the wrong length
+    // dimension at the root to show that it resolves up to the root when checking dimension length.
+    // This is not the ideal behavior; in the future, we probably want it to create a dimension
+    // in the group if the parent dim has the wrong length.
+    assert!(
+        res.is_err(),
+        "Writing should fail when dimension in parent group has wrong length"
+    );
+}
+
+#[test]
+fn test_sibling_dims() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("group.nc");
+
+    {
+        let mut file = netcdf::create(&path).unwrap();
+        {
+            let mut grp1 = file.add_group("site_pa").unwrap();
+            sample().write_netcdf(&mut grp1).unwrap();
+        }
+        {
+            let mut grp2 = file.add_group("site_oc").unwrap();
+            // the second data instance has 3 elements in the "time" dimension, so
+            // for this to work it must have separate "time" dimensions in the site_pa
+            // and site_oc groups
+            sample2().write_netcdf(&mut grp2).unwrap();
+        }
+    }
+
+    let file = netcdf::open(&path).unwrap();
+    assert_eq!(file.dimension("site_pa/time").unwrap().len(), 2);
+    assert_eq!(file.dimension("site_oc/time").unwrap().len(), 3);
 }
