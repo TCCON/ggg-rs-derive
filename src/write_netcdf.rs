@@ -30,6 +30,7 @@
 //! may not even depend on).
 
 use darling::ast::NestedMeta;
+use darling::util::Override;
 use darling::{FromDeriveInput, FromField, FromMeta, ast};
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
@@ -92,7 +93,7 @@ struct NcVarAttr {
 }
 
 #[derive(FromField)]
-#[darling(attributes(netcdf))]
+#[darling(attributes(netcdf), forward_attrs(doc))]
 struct WriteNetcdfField {
     ident: Option<syn::Ident>,
     ty: syn::Type,
@@ -135,6 +136,23 @@ struct WriteNetcdfField {
     /// this field explicitly.
     #[darling(default, multiple, rename = "attr")]
     var_attrs: Vec<NcVarAttr>,
+
+    /// The raw field attributes, filled by darling because of the magic name
+    /// `attrs`. Used only to read `///` doc comments (which the compiler lowers
+    /// to `#[doc = "..."]`) for the description feature.
+    attrs: Vec<syn::Attribute>,
+
+    /// Per-field override of the container-level `describe`. `#[netcdf(describe)]`
+    /// turns descriptions on for this field using the inherited attribute name;
+    /// `#[netcdf(describe = "notes")]` also overrides the attribute name (as with
+    /// `rename`).
+    #[darling(default)]
+    describe: Option<Override<String>>,
+
+    /// Disable the field's doc-comment description even when the container turns
+    /// descriptions on for every field.
+    #[darling(default)]
+    no_describe: bool,
 }
 
 #[derive(FromDeriveInput)]
@@ -147,6 +165,13 @@ struct WriteNetcdfInput {
     /// serde-style case convention applied to every field's netCDF name.
     #[darling(default)]
     rename_all: Option<String>,
+
+    /// Write each field's `///` doc comment as a variable attribute. The word
+    /// form `#[netcdf(describe)]` uses the default attribute name `"description"`;
+    /// `#[netcdf(describe = "long_name")]` chooses the attribute name. Individual
+    /// fields can override the name or opt out with `#[netcdf(no_describe)]`.
+    #[darling(default)]
+    describe: Option<Override<String>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -267,6 +292,8 @@ fn resolve_field(f: &WriteNetcdfField) -> Result<WriteKind, darling::Error> {
             || f.map.is_some()
             || f.map_units.is_some()
             || !f.var_attrs.is_empty()
+            || f.describe.is_some()
+            || f.no_describe
         {
             return Err(err("`skip` cannot be combined with any other `netcdf` option"));
         }
@@ -276,6 +303,11 @@ fn resolve_field(f: &WriteNetcdfField) -> Result<WriteKind, darling::Error> {
     // `map` and `map_units` are mutually exclusive.
     if f.map.is_some() && f.map_units.is_some() {
         return Err(err("`map` and `map_units` cannot be used together"));
+    }
+
+    // `describe` and `no_describe` contradict each other.
+    if f.describe.is_some() && f.no_describe {
+        return Err(err("`describe` and `no_describe` cannot be used together"));
     }
 
     // Each `attr(...)` needs exactly one of `value` / `func`.
@@ -294,9 +326,15 @@ fn resolve_field(f: &WriteNetcdfField) -> Result<WriteKind, darling::Error> {
     // A field written as a group attribute is not a variable, so variable-only
     // options don't apply.
     if f.attribute {
-        if has_dims || f.kind.is_some() || !f.var_attrs.is_empty() || f.map_units.is_some() {
+        if has_dims
+            || f.kind.is_some()
+            || !f.var_attrs.is_empty()
+            || f.map_units.is_some()
+            || f.describe.is_some()
+            || f.no_describe
+        {
             return Err(err(
-                "`attribute` is incompatible with `dimensions`, `kind`, `attr`, and `map_units`",
+                "`attribute` is incompatible with `dimensions`, `kind`, `attr`, `map_units`, and `describe`",
             ));
         }
         return Ok(WriteKind::Attribute);
@@ -395,6 +433,65 @@ fn nc_name(
     match rename_all {
         Some(rule) => apply_rename_all(&field, rule),
         None => Ok(field),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Descriptions from doc comments
+// ---------------------------------------------------------------------------
+
+/// Collect a field's `///` doc comment into a single trimmed string. The
+/// compiler lowers each `///` line to a `#[doc = "..."]` attribute, so we glue
+/// those back together. Returns `None` when the field has no doc comment.
+fn extract_doc(attrs: &[syn::Attribute]) -> Option<String> {
+    let mut lines = Vec::new();
+    for attr in attrs {
+        if !attr.path().is_ident("doc") {
+            continue;
+        }
+        if let syn::Meta::NameValue(nv) = &attr.meta {
+            if let syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(s),
+                ..
+            }) = &nv.value
+            {
+                let line = s.value();
+                // rustdoc keeps the single space after `///`; drop it so the
+                // stored text isn't uniformly indented.
+                lines.push(line.strip_prefix(' ').unwrap_or(&line).to_string());
+            }
+        }
+    }
+    let text = lines.join("\n");
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Decide whether a field gets a description attribute and, if so, its name.
+/// Mirrors rename resolution: the container sets the default, each field may
+/// override the name or opt out.
+fn resolve_describe(
+    container: Option<&Override<String>>,
+    field: Option<&Override<String>>,
+    no_describe: bool,
+) -> Option<String> {
+    // The container default is a pair of (enabled, attribute name).
+    let (container_on, container_name): (bool, String) = match container {
+        None => (false, "description".to_string()),
+        Some(Override::Inherit) => (true, "description".to_string()),
+        Some(Override::Explicit(name)) => (true, name.clone()),
+    };
+    if no_describe {
+        return None;
+    }
+    match field {
+        None => container_on.then_some(container_name),
+        Some(Override::Inherit) => Some(container_name),
+        Some(Override::Explicit(name)) => Some(name.clone()),
     }
 }
 
@@ -535,8 +632,14 @@ impl HelpersNeeded {
 // Per-field code generation
 // ---------------------------------------------------------------------------
 
-/// Build the `{ ... }` statement block that writes one field.
-fn field_block(f: &WriteNetcdfField, wk: WriteKind, name: &str) -> TokenStream2 {
+/// Build the `{ ... }` statement block that writes one field. `description`, if
+/// present, is the `(attribute name, text)` to attach to the created variable.
+fn field_block(
+    f: &WriteNetcdfField,
+    wk: WriteKind,
+    name: &str,
+    description: Option<(String, String)>,
+) -> TokenStream2 {
     let ident = f.ident.as_ref().unwrap();
     let mapped = f.map.is_some() || f.map_units.is_some();
 
@@ -562,6 +665,11 @@ fn field_block(f: &WriteNetcdfField, wk: WriteKind, name: &str) -> TokenStream2 
 
     // Attribute statements applied to the created variable (`__var`).
     let mut attr_stmts = TokenStream2::new();
+    // The doc-comment description is written first so an explicit `attr(...)`
+    // could intentionally shadow it if desired.
+    if let Some((desc_attr, desc_text)) = &description {
+        attr_stmts.extend(quote! { __var.put_attribute(#desc_attr, #desc_text)?; });
+    }
     for a in &f.var_attrs {
         let an = &a.name;
         if let Some(v) = &a.value {
@@ -686,8 +794,15 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
         let Some(name) = errors.handle(nc_name(f, rename_all)) else {
             continue;
         };
+        // Descriptions only apply to variables, not to group-attribute fields.
+        let description = if wk == WriteKind::Attribute {
+            None
+        } else {
+            resolve_describe(parsed.describe.as_ref(), f.describe.as_ref(), f.no_describe)
+                .and_then(|attr| extract_doc(&f.attrs).map(|doc| (attr, doc)))
+        };
         helpers.note(wk);
-        field_blocks.push(field_block(f, wk, &name));
+        field_blocks.push(field_block(f, wk, &name, description));
     }
 
     if let Err(e) = errors.finish() {

@@ -170,6 +170,25 @@ pub fn derive_subset(input: TokenStream) -> TokenStream {
 /// `PascalCase`, `lowercase`, `UPPERCASE`, `SCREAMING-KEBAB-CASE`) to every
 /// field's netCDF name.
 ///
+/// `#[netcdf(describe)]` — write each field's `///` doc comment as a variable
+/// attribute. The bare word uses the attribute name `"description"`; the
+/// `#[netcdf(describe = "long_name")]` form chooses a different attribute name.
+/// Fields with no doc comment contribute nothing, and individual fields can
+/// override the attribute name or opt out (see the field attributes below).
+///
+/// ```no_run
+/// use ggg_rs_derive::WriteNetcdf;
+///
+/// #[derive(WriteNetcdf)]
+/// #[netcdf(describe = "long_name")]
+/// struct Data {
+///     /// Column-averaged dry-air mole fraction of CO2
+///     // Writes a `long_name` attribute with the text above.
+///     #[netcdf(dimensions("time"))]
+///     xco2: Vec<f64>,
+/// }
+/// ```
+///
 /// # Field attributes
 /// `#[netcdf(dimensions("d0", "d1", ...))]` is required. It lists the dimension
 /// names that map to each dimension of the field. `Vec` types only need a single
@@ -221,7 +240,37 @@ pub fn derive_subset(input: TokenStream) -> TokenStream {
 ///     wmo_scale: Vec<String>
 /// }
 /// ```
-///  
+///
+/// `#[netcdf(describe)]` / `#[netcdf(describe = "name")]` / `#[netcdf(no_describe)]`
+/// overrides the container-level `describe` for a single field, in the same way
+/// `rename` overrides `rename_all`. The bare word turns descriptions on for this
+/// field (using the inherited attribute name), the `= "name"` form also changes
+/// the attribute name, and `no_describe` opts the field out even when the
+/// container enables descriptions for everything.
+///
+/// ```no_run
+/// use ggg_rs_derive::WriteNetcdf;
+///
+/// #[derive(WriteNetcdf)]
+/// #[netcdf(describe = "long_name")]
+/// struct Data {
+///     /// Column-averaged dry-air mole fraction of CO2
+///     // Written to the "long_name" attribute (inherited from the container).
+///     #[netcdf(dimensions("time"))]
+///     xco2: Vec<f64>,
+///
+///     /// Surface pressure
+///     // This field overrides the attribute name to "comment".
+///     #[netcdf(dimensions("time"), describe = "comment")]
+///     psurf: Vec<f64>,
+///
+///     /// Internal bookkeeping counter
+///     // No description attribute is written for this field.
+///     #[netcdf(dimensions("time"), no_describe)]
+///     counter: Vec<i32>,
+/// }
+/// ```
+///
 /// `#[netcdf(kind = "values" | "array" | "string")]` sets how the field is written;
 ///   "values" uses the [`netcdf::VariableMut::put_values`] method, "array" the
 ///   [`netcdf::VariableMut::put`] method, and "string" will iterate over the elements,

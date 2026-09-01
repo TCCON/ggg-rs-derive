@@ -1,4 +1,4 @@
-error: `attribute` is incompatible with `dimensions`, `kind`, `attr`, and `map_units`
+error: `attribute` is incompatible with `dimensions`, `kind`, `attr`, `map_units`, and `describe`
  --> tests/ui/nc_attribute_with_dims.rs:6:5
   |
 6 |     source: String,

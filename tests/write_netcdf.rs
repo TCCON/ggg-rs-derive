@@ -222,3 +222,67 @@ fn test_sibling_dims() {
     assert_eq!(file.dimension("site_pa/time").unwrap().len(), 2);
     assert_eq!(file.dimension("site_oc/time").unwrap().len(), 3);
 }
+
+/// Container turns descriptions on (named "long_name"); fields override the
+/// attribute name, opt out, or contribute nothing when they lack a doc comment.
+#[derive(WriteNetcdf)]
+#[netcdf(describe = "long_name")]
+struct Described {
+    /// Column-averaged dry-air mole fraction of CO2
+    #[netcdf(dimensions("time"))]
+    xco2: Vec<f64>,
+
+    /// Surface pressure
+    #[netcdf(dimensions("time"), describe = "comment")]
+    psurf: Vec<f64>,
+
+    /// Internal bookkeeping counter
+    #[netcdf(dimensions("time"), no_describe)]
+    counter: Vec<i32>,
+
+    // No doc comment: nothing to write even though the container enables it.
+    #[netcdf(dimensions("time"))]
+    plain: Vec<f64>,
+}
+
+#[test]
+fn writes_doc_comments_as_description_attributes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("described.nc");
+
+    {
+        let mut file = netcdf::create(&path).unwrap();
+        let mut root = file.root_mut().unwrap();
+        Described {
+            xco2: vec![400.0],
+            psurf: vec![1000.0],
+            counter: vec![1],
+            plain: vec![0.0],
+        }
+        .write_netcdf(&mut root)
+        .unwrap();
+    }
+
+    let file = netcdf::open(&path).unwrap();
+
+    // Container default attribute name is "long_name".
+    let xco2 = file.variable("xco2").unwrap();
+    assert_eq!(
+        xco2.attribute("long_name").unwrap().value().unwrap(),
+        netcdf::AttributeValue::Str("Column-averaged dry-air mole fraction of CO2".to_string())
+    );
+
+    // Field overrides the attribute name to "comment" (and drops "long_name").
+    let psurf = file.variable("psurf").unwrap();
+    assert!(psurf.attribute("long_name").is_none());
+    assert_eq!(
+        psurf.attribute("comment").unwrap().value().unwrap(),
+        netcdf::AttributeValue::Str("Surface pressure".to_string())
+    );
+
+    // `no_describe` opts the field out entirely.
+    assert!(file.variable("counter").unwrap().attribute("long_name").is_none());
+
+    // No doc comment => no description attribute.
+    assert!(file.variable("plain").unwrap().attribute("long_name").is_none());
+}
