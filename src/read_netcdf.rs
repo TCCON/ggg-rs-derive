@@ -26,9 +26,10 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
     // unknown rule is reported even on an empty struct.
     let mut errors = darling::Error::accumulator();
     if let Some(rule) = rename_all
-        && let Err(e) = apply_rename_all("x", rule) {
-            errors.push(e);
-        }
+        && let Err(e) = apply_rename_all("x", rule)
+    {
+        errors.push(e);
+    }
 
     let mut helpers = HelpersNeeded::default();
     let mut field_blocks: Vec<TokenStream2> = Vec::new();
@@ -61,8 +62,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
         if map_fns.map_units.is_some() {
             helpers.get_units = true;
         }
-        // TODO: get unit attribute from field annotation
-        field_blocks.push(field_block(f, read_kind, &name, None, map_fns));
+        field_blocks.push(field_block(f, read_kind, &name, map_fns));
         field_names.push(fieldname);
     }
 
@@ -473,10 +473,8 @@ fn field_block(
     field: &ReadNetcdfField,
     read_kind: NcKind,
     varname: &str,
-    unit_attr: Option<&str>,
     map_fns: MapFns<'_>,
 ) -> TokenStream2 {
-    let unit_attr = unit_attr.unwrap_or("units");
     let fieldname = field.ident.as_ref().unwrap();
     // `map`/`map_units` receive the *struct field* name, not the netCDF variable
     // name. `String` tokenizes as a string literal; note that quote! does not
@@ -515,7 +513,7 @@ fn field_block(
         quote! {
             #map_fxn(__val, #fieldname_str)?
         }
-    } else if let Some(map_fxn) = map_fns.map_units {
+    } else if let Some((map_fxn, unit_attr)) = map_fns.map_units {
         quote! {
             let __units = __get_units(grp, #varname, #unit_attr)?;
             #map_fxn(__val, #fieldname_str, __units.as_deref())?

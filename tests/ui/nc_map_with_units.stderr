@@ -1,0 +1,7 @@
+error: `map()` cannot contain a `units_attr` field, as only a `map_units` attribute uses units
+  --> tests/ui/nc_map_with_units.rs:14:10
+   |
+14 | #[derive(WriteNetcdf)]
+   |          ^^^^^^^^^^^
+   |
+   = note: this error originates in the derive macro `WriteNetcdf` (in Nightly builds, run with -Z macro-backtrace for more info)

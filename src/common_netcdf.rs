@@ -35,6 +35,11 @@ const MAP_FORM_HELP: &str = "`map` and `map_units` need an explicit direction, b
      and writing require different functions: `map(write = path::to::fn)`, \
      `map(read = path::to::fn)`, or both";
 
+const MAP_UNITS_HELP: &str =
+    "`map()` cannot contain a `units_attr` field, as only a `map_units` attribute uses units";
+
+const DEFAULT_UNIT_ATTR: &str = "units";
+
 /// The function pair behind `#[netcdf(map(...))]` / `#[netcdf(map_units(...))]`.
 ///
 /// The two directions are *not* interchangeable — they are inverses of each
@@ -47,6 +52,7 @@ const MAP_FORM_HELP: &str = "`map` and `map_units` need an explicit direction, b
 pub(crate) struct MapSpec {
     pub(crate) write: Option<syn::Path>,
     pub(crate) read: Option<syn::Path>,
+    pub(crate) units_attr: Option<String>,
 }
 
 /// The `write = ...` / `read = ...` body of a `map(...)`, parsed by darling.
@@ -58,6 +64,7 @@ struct MapSpecFields {
     write: Option<syn::Path>,
     #[darling(default)]
     read: Option<syn::Path>,
+    units_attr: Option<String>,
 }
 
 impl FromMeta for MapSpec {
@@ -70,6 +77,7 @@ impl FromMeta for MapSpec {
         Ok(Self {
             write: fields.write,
             read: fields.read,
+            units_attr: fields.units_attr,
         })
     }
 
@@ -89,7 +97,7 @@ impl FromMeta for MapSpec {
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct MapFns<'a> {
     pub(crate) map: Option<&'a syn::Path>,
-    pub(crate) map_units: Option<&'a syn::Path>,
+    pub(crate) map_units: Option<(&'a syn::Path, &'a str)>,
 }
 
 impl<'a> MapFns<'a> {
@@ -104,9 +112,22 @@ impl<'a> MapFns<'a> {
         dir: Direction,
         ident: &syn::Ident,
     ) -> Result<Self, darling::Error> {
+        if map.is_some_and(|m| m.units_attr.is_some()) {
+            return Err(darling::Error::custom(MAP_UNITS_HELP));
+        }
+
+        let map_fxn = direction_fn(map, "map", dir, ident)?;
+        let map_units_fxn = direction_fn(map_units, "map_units", dir, ident)?;
+        let map_units_tuple = map_units.map(|m| {
+            (
+                map_units_fxn.unwrap(),
+                m.units_attr.as_deref().unwrap_or(DEFAULT_UNIT_ATTR),
+            )
+        });
+
         Ok(Self {
-            map: direction_fn(map, "map", dir, ident)?,
-            map_units: direction_fn(map_units, "map_units", dir, ident)?,
+            map: map_fxn,
+            map_units: map_units_tuple,
         })
     }
 
@@ -228,9 +249,10 @@ pub(crate) fn vec_element_type(ty: &Type) -> Option<&Type> {
         return None;
     }
     if let syn::PathArguments::AngleBracketed(args) = &seg.arguments
-        && let Some(syn::GenericArgument::Type(t)) = args.args.first() {
-            return Some(t);
-        }
+        && let Some(syn::GenericArgument::Type(t)) = args.args.first()
+    {
+        return Some(t);
+    }
     None
 }
 
@@ -279,13 +301,14 @@ pub(crate) fn infer_kind(ty: &Type) -> Result<NcKind, darling::Error> {
         };
     }
     if let Type::Path(p) = ty
-        && let Some(seg) = p.path.segments.last() {
-            if seg.ident.to_string().starts_with("Array") {
-                return Ok(NcKind::Array);
-            }
-            // Numeric/bool scalars fall through to `Scalar`.
-            return Ok(NcKind::Scalar);
+        && let Some(seg) = p.path.segments.last()
+    {
+        if seg.ident.to_string().starts_with("Array") {
+            return Ok(NcKind::Array);
         }
+        // Numeric/bool scalars fall through to `Scalar`.
+        return Ok(NcKind::Scalar);
+    }
     Err(darling::Error::custom(
         "couldn't infer how to write this field — annotate with \
          #[netcdf(kind = \"values\"|\"array\"|\"string\")], #[netcdf(attribute)], \

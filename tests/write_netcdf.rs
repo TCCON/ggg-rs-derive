@@ -1,11 +1,13 @@
 //! Integration tests for `#[derive(WriteNetcdf)]`: write a struct to a real
 //! netCDF file, reopen it, and assert on variables, attributes, and dimensions.
 
+use std::{assert_eq, vec};
+
 use ggg_rs_derive::WriteNetcdf;
 use ndarray::{Array2, array};
 
 /// `map_units` hook: convert a fraction to ppm and report the units string.
-fn frac_to_ppm(_data: &Data, values: &Vec<f64>, _name: &str) -> (Vec<f64>, String) {
+fn frac_to_ppm<T>(_data: &T, values: &Vec<f64>, _name: &str) -> (Vec<f64>, String) {
     (
         values.iter().map(|v| v * 1.0e6).collect(),
         "ppm".to_string(),
@@ -329,4 +331,37 @@ fn test_bad_dim_error() {
             "Expected Err(netcdf::Error::Str) from call to write_netcdf(), got: {res:?}"
         );
     }
+}
+
+#[derive(WriteNetcdf)]
+struct CustUnitAttr {
+    #[netcdf(dimensions("time"), map_units(write = frac_to_ppm, units_attr = "unit_abbrev"), kind = "values")]
+    xco2: Vec<f64>,
+}
+
+#[test]
+fn test_write_alternate_units_attr() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("described.nc");
+
+    {
+        let test = CustUnitAttr {
+            xco2: vec![400e-6, 401e-6, 402e-6],
+        };
+        let mut file = netcdf::create(&path).unwrap();
+        let mut root = file.root_mut().unwrap();
+        test.write_netcdf(&mut root).unwrap();
+    }
+
+    let file = netcdf::open(&path).unwrap();
+    // check that it did not write "units" but did write "unit_abbrev"
+    let var = file.variable("xco2").unwrap();
+    assert!(var.attribute("units").is_none());
+    let u: String = var
+        .attribute_value("unit_abbrev")
+        .expect("should have written 'unit_abbrev' attribute")
+        .unwrap()
+        .try_into()
+        .expect("'unit_abbrev' should be a string");
+    assert_eq!(u, "ppm")
 }

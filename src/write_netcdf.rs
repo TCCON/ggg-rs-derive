@@ -230,7 +230,12 @@ fn resolve_field(f: &WriteNetcdfField) -> Result<(NcKind, MapFns<'_>), darling::
     }
 
     // Narrow each `map(...)` spec down to the function this derive needs.
-    let map_fns = MapFns::resolve(f.map.as_ref(), f.map_units.as_ref(), Direction::Write, ident)?;
+    let map_fns = MapFns::resolve(
+        f.map.as_ref(),
+        f.map_units.as_ref(),
+        Direction::Write,
+        ident,
+    )?;
 
     // A field written as a group attribute is not a variable, so variable-only
     // options don't apply.
@@ -287,12 +292,12 @@ fn extract_doc(attrs: &[syn::Attribute]) -> Option<String> {
                 lit: syn::Lit::Str(s),
                 ..
             }) = &nv.value
-            {
-                let line = s.value();
-                // rustdoc keeps the single space after `///`; drop it so the
-                // stored text isn't uniformly indented.
-                lines.push(line.strip_prefix(' ').unwrap_or(&line).to_string());
-            }
+        {
+            let line = s.value();
+            // rustdoc keeps the single space after `///`; drop it so the
+            // stored text isn't uniformly indented.
+            lines.push(line.strip_prefix(' ').unwrap_or(&line).to_string());
+        }
     }
     let text = lines.join(" ");
     let trimmed = text.trim();
@@ -495,7 +500,7 @@ fn field_block(
             quote! { let __val = #m(self, &self.#ident, #name); },
             quote!(__val),
         )
-    } else if let Some(m) = map_fns.map_units {
+    } else if let Some((m, _)) = map_fns.map_units {
         (
             quote! { let (__val, __units) = #m(self, &self.#ident, #name); },
             quote!(__val),
@@ -527,8 +532,8 @@ fn field_block(
                 .extend(quote! { __var.put_attribute(#an, #func(self, &self.#ident, #name))?; });
         }
     }
-    if map_fns.map_units.is_some() {
-        attr_stmts.extend(quote! { __var.put_attribute("units", __units)?; });
+    if let Some((_, unit_attr)) = map_fns.map_units {
+        attr_stmts.extend(quote! { __var.put_attribute(#unit_attr, __units)?; });
     }
     let needs_var = !attr_stmts.is_empty();
 
@@ -632,9 +637,10 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
     // unknown rule is reported even on an empty struct.
     let mut errors = darling::Error::accumulator();
     if let Some(rule) = rename_all
-        && let Err(e) = apply_rename_all("x", rule) {
-            errors.push(e);
-        }
+        && let Err(e) = apply_rename_all("x", rule)
+    {
+        errors.push(e);
+    }
 
     let mut helpers = HelpersNeeded::default();
     let mut field_blocks: Vec<TokenStream2> = Vec::new();

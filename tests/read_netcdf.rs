@@ -1,10 +1,8 @@
-use std::assert_eq;
-
 use ggg_rs_derive::{ReadNetcdf, WriteNetcdf};
 use ndarray::{Array2, array};
 
 /// Write half of `map_units`: scale to ppm and report the units string.
-fn frac_to_ppm(_data: &Data, values: &Vec<f64>, _name: &str) -> (Vec<f64>, String) {
+fn frac_to_ppm<T>(_data: &T, values: &Vec<f64>, _name: &str) -> (Vec<f64>, String) {
     (
         values.iter().map(|v| v * 1.0e6).collect(),
         "ppm".to_string(),
@@ -151,4 +149,46 @@ fn test_read_map_error_propagates() {
         msg.contains("xluft") && msg.contains("percent"),
         "unexpected error message: {msg}"
     );
+}
+
+#[derive(Debug, ReadNetcdf, WriteNetcdf)]
+struct CustUnitAttr {
+    #[netcdf(
+        rename = "xluft_ppm",
+        dimensions("time"),
+        map_units(write = frac_to_ppm, read = ppm_to_frac, units_attr = "unit_abbrev"),
+        kind = "values"
+    )]
+    xluft: Vec<f64>,
+}
+
+#[test]
+fn test_read_custom_unit_attr() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("root.nc");
+    let cust = CustUnitAttr {
+        xluft: vec![1.0, 0.5, 0.25],
+    };
+
+    {
+        let mut file = netcdf::create(&path).unwrap();
+        let mut root = file.root_mut().unwrap();
+        cust.write_netcdf(&mut root).unwrap();
+    }
+
+    // Verify that the xluft values were written as x*1e6 and the unit abbrev
+    // attribute exists, but "units" does not - otherwise this test could
+    // pass spuriously
+    let file = netcdf::open(&path).unwrap();
+    let root = file.root().unwrap();
+    {
+        let var = root.variable("xluft_ppm").unwrap();
+        assert!(var.attribute("units").is_none());
+        assert!(var.attribute("unit_abbrev").is_some());
+        let vals: Vec<f64> = var.get_values::<f64, _>(..).unwrap();
+        assert_eq!(vals, vec![1e6, 0.5e6, 0.25e6]);
+    }
+
+    let read = CustUnitAttr::read_netcdf(&root).unwrap();
+    assert_eq!(read.xluft, cust.xluft);
 }
