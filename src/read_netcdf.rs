@@ -4,7 +4,8 @@ use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 
 use crate::common_netcdf::{
-    DimList, NcKind, apply_rename_all, infer_kind, kind_from_str, nc_name, validate_dims,
+    DimList, Direction, MapFns, MapSpec, NcKind, apply_rename_all, infer_kind, kind_from_str,
+    nc_name, validate_dims,
 };
 
 pub(crate) fn expand(input: TokenStream) -> TokenStream {
@@ -24,11 +25,10 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
     // Validate `rename_all` once up front (with an empty field name) so an
     // unknown rule is reported even on an empty struct.
     let mut errors = darling::Error::accumulator();
-    if let Some(rule) = rename_all {
-        if let Err(e) = apply_rename_all("x", rule) {
+    if let Some(rule) = rename_all
+        && let Err(e) = apply_rename_all("x", rule) {
             errors.push(e);
         }
-    }
 
     let mut helpers = HelpersNeeded::default();
     let mut field_blocks: Vec<TokenStream2> = Vec::new();
@@ -37,7 +37,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
     for f in &fields {
         // Resolve the read strategy and the netCDF name, collecting errors so
         // every problem is reported in one compile.
-        let Some(read_kind) = errors.handle(resolve_field(f)) else {
+        let Some((read_kind, map_fns)) = errors.handle(resolve_field(f)) else {
             continue;
         };
         let fieldname = f.ident.as_ref().unwrap().clone();
@@ -58,11 +58,11 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
         };
 
         helpers.set_needed_helpers_for_kind(read_kind);
-        if f.map_units.is_some() {
+        if map_fns.map_units.is_some() {
             helpers.get_units = true;
         }
         // TODO: get unit attribute from field annotation
-        field_blocks.push(field_block(f, read_kind, &name, None));
+        field_blocks.push(field_block(f, read_kind, &name, None, map_fns));
         field_names.push(fieldname);
     }
 
@@ -127,17 +127,22 @@ struct ReadNetcdfField {
     #[darling(default)]
     attribute: bool,
 
-    /// Map the field value after reading: `fn(&NcTy, &str) -> Out`.
-    /// The function arguments are the value returned from the netCDF
-    /// file and the field name.
+    /// Map the field value after reading. The direction is mandatory, since
+    /// writing needs a different function: `map(read = path::to::fn)`, where the
+    /// function is `fn(NcTy, &str) -> netcdf::Result<Out>`. Its arguments are
+    /// the value read from the netCDF file (by value) and the struct field name.
+    /// Reading is fallible — the data comes from a file this program did not
+    /// necessarily write — so the function returns a `netcdf::Result`. A
+    /// `write = ...` may also be present for `WriteNetcdf`; it is ignored here.
     #[darling(default)]
-    map: Option<syn::Path>,
+    map: Option<MapSpec>,
 
-    /// Like `map`, but also accepts the value of the `units` attribute
-    /// as the third argument: `fn(&NcTy, &str, Option<&str>) -> Out`.
-    /// If no `units`, the third argument will be `None`.
+    /// Like `map`, but the read function also accepts the value of the `units`
+    /// attribute as a third argument:
+    /// `fn(NcTy, &str, Option<&str>) -> netcdf::Result<Out>`.
+    /// If the variable has no `units`, the third argument is `None`.
     #[darling(default)]
-    map_units: Option<syn::Path>,
+    map_units: Option<MapSpec>,
 }
 
 #[derive(Debug, Default)]
@@ -395,9 +400,9 @@ impl HelpersNeeded {
     }
 }
 
-/// Resolve the netCDF kind of the field (array, string, skipped, etc.) and
-/// check the annotations for errors.
-fn resolve_field(field: &ReadNetcdfField) -> Result<NcKind, darling::Error> {
+/// Resolve the netCDF kind of the field (array, string, skipped, etc.) and the
+/// map functions that apply when reading, checking the annotations for errors.
+fn resolve_field(field: &ReadNetcdfField) -> Result<(NcKind, MapFns<'_>), darling::Error> {
     let ident = field.ident.as_ref().unwrap();
     let err = |msg: &str| darling::Error::custom(msg).with_span(ident);
 
@@ -415,13 +420,21 @@ fn resolve_field(field: &ReadNetcdfField) -> Result<NcKind, darling::Error> {
                 "`skip` cannot be combined with any other `netcdf` option",
             ));
         }
-        return Ok(NcKind::Skip);
+        return Ok((NcKind::Skip, MapFns::default()));
     }
 
     // `map` and `map_units` are mutually exclusive
     if field.map.is_some() && field.map_units.is_some() {
         return Err(err("`map` and `map_units` cannot be used together"));
     }
+
+    // Narrow each `map(...)` spec down to the function this derive needs.
+    let map_fns = MapFns::resolve(
+        field.map.as_ref(),
+        field.map_units.as_ref(),
+        Direction::Read,
+        ident,
+    )?;
 
     // A field written as a group attribute is not a variable, so variable-only
     // options don't apply.
@@ -431,18 +444,18 @@ fn resolve_field(field: &ReadNetcdfField) -> Result<NcKind, darling::Error> {
                 "`attribute` is incompatible with `dimensions`, `kind`, `attr`, `map_units`, and `describe`",
             ));
         }
-        return Ok(NcKind::Attribute);
+        return Ok((NcKind::Attribute, map_fns));
     }
 
-    // With a `map`/`map_units` the written type is opaque, so `kind` is required.
-    if field.map.is_some() || field.map_units.is_some() {
+    // With a `map`/`map_units` the read type is opaque, so `kind` is required.
+    if map_fns.any() {
         let Some(kind) = &field.kind else {
             return Err(err(
                 "`map`/`map_units` requires an explicit `kind = \"values\"|\"array\"|\"string\"`",
             ));
         };
         let nck = kind_from_str(kind, &field.ty).map_err(|e| e.with_span(ident))?;
-        return validate_dims(nck, has_dims, &field.dimensions, ident).map(|()| nck);
+        return validate_dims(nck, has_dims, &field.dimensions, ident).map(|()| (nck, map_fns));
     }
 
     // Explicit `kind`, else infer from the type.
@@ -451,7 +464,7 @@ fn resolve_field(field: &ReadNetcdfField) -> Result<NcKind, darling::Error> {
     } else {
         infer_kind(&field.ty).map_err(|e| e.with_span(ident))?
     };
-    validate_dims(rk, has_dims, &field.dimensions, ident).map(|()| rk)
+    validate_dims(rk, has_dims, &field.dimensions, ident).map(|()| (rk, map_fns))
 }
 
 /// Return code that assigns a variable named with the field's name to the result
@@ -461,6 +474,7 @@ fn field_block(
     read_kind: NcKind,
     varname: &str,
     unit_attr: Option<&str>,
+    map_fns: MapFns<'_>,
 ) -> TokenStream2 {
     let unit_attr = unit_attr.unwrap_or("units");
     let fieldname = field.ident.as_ref().unwrap();
@@ -493,17 +507,18 @@ fn field_block(
         NcKind::Skip => unreachable!("skip fields are filtered out before codegen"),
     };
 
-    // If we need to map values, include that here. Remember that map functions have
-    // a signature of (netcdf_value, field_name) and map_unit functions have
-    // (netcdf_value, field_name, unit_string)
-    let remap = if let Some(map_fxn) = field.map.as_ref() {
+    // If we need to map values, include that here. Remember that read map functions
+    // have a signature of (netcdf_value, field_name) -> netcdf::Result<Out> and read
+    // map_unit functions have (netcdf_value, field_name, unit_string) -> netcdf::Result<Out>.
+    // Both are fallible, so their calls take a `?`.
+    let remap = if let Some(map_fxn) = map_fns.map {
         quote! {
-            #map_fxn(__val, #fieldname_str)
+            #map_fxn(__val, #fieldname_str)?
         }
-    } else if let Some(map_fxn) = field.map_units.as_ref() {
+    } else if let Some(map_fxn) = map_fns.map_units {
         quote! {
             let __units = __get_units(grp, #varname, #unit_attr)?;
-            #map_fxn(__val, #fieldname_str, __units.as_deref())
+            #map_fxn(__val, #fieldname_str, __units.as_deref())?
         }
     } else {
         quote!(__val)

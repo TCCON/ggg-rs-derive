@@ -55,8 +55,8 @@ fn classify_container(
             other => Err(darling::Error::custom(format!("unknown kind \"{other}\""))),
         };
     }
-    if let Type::Path(type_path) = ty {
-        if let Some(seg) = type_path.path.segments.last() {
+    if let Type::Path(type_path) = ty
+        && let Some(seg) = type_path.path.segments.last() {
             let ident = seg.ident.to_string();
             if ident == "Vec" {
                 return Ok(ValueKind::Vec);
@@ -67,7 +67,6 @@ fn classify_container(
                 });
             }
         }
-    }
     Err(darling::Error::custom("couldn't infer container kind"))
 }
 
@@ -130,8 +129,8 @@ fn resolve_kind(f: &SubsetField) -> Result<FieldKind, darling::Error> {
     }
 
     // Fallback: infer from the type's last path segment.
-    if let Type::Path(type_path) = &f.ty {
-        if let Some(seg) = type_path.path.segments.last() {
+    if let Type::Path(type_path) = &f.ty
+        && let Some(seg) = type_path.path.segments.last() {
             let ty_ident = seg.ident.to_string();
             if ty_ident == "Vec" {
                 if f.axis.is_some() {
@@ -148,7 +147,6 @@ fn resolve_kind(f: &SubsetField) -> Result<FieldKind, darling::Error> {
                 });
             }
         }
-    }
 
     Err(darling::Error::custom(
         "couldn't infer field kind — annotate with #[subset(kind = \"vec\")], \

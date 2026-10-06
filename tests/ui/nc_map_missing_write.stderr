@@ -1,0 +1,5 @@
+error: `map` on this field has no `write = ...`, which `WriteNetcdf` requires
+  --> tests/ui/nc_map_missing_write.rs:12:5
+   |
+12 |     values: Vec<f64>,
+   |     ^^^^^^

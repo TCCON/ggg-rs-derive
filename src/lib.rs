@@ -371,12 +371,17 @@ pub fn derive_subset(input: TokenStream) -> TokenStream {
 /// }
 /// ```
 ///
-/// `#[netcdf(map = path::to::fn)]` allows you to define a function to transform the value
-///  before writing. The function must take 3 arguments, a reference to the struct,
-///  a reference to the field values, and the field name: `fn(&Self, &FieldTy, &str) -> Out.
+/// `#[netcdf(map(write = path::to::fn))]` allows you to define a function to transform
+///  the value before writing. The function must take 3 arguments, a reference to the struct,
+///  a reference to the field values, and the field name: `fn(&Self, &FieldTy, &str) -> Out`.
 ///  This allows you to work around types that cannot be directly written to netCDF files,
 ///  such as [`chrono::DateTime`] instances. Note that this must be combined with the "kind"
 ///  attribute, as the macro will not be able to infer the output type.
+///
+/// The direction is part of the syntax and cannot be omitted. Reading needs the
+/// *inverse* function, so `ReadNetcdf` looks for `map(read = ...)` instead — see
+/// the [`ReadNetcdf`] docs. A struct that derives both puts both halves in the
+/// same `map(...)`: `map(write = to_nc, read = from_nc)`.
 ///
 /// ```no_run
 /// use ggg_rs_derive::WriteNetcdf;
@@ -390,12 +395,12 @@ pub fn derive_subset(input: TokenStream) -> TokenStream {
 /// struct Data {
 ///     // `DateTime<_>` doesn't implement `NcTypeDescriptor`, so we have to change it
 ///     // to a type that does. Note that we also provide the "kind" attribute.
-///     #[netcdf(dimensions("time"), map = datetime_to_timestamp, kind = "values")]
+///     #[netcdf(dimensions("time"), map(write = datetime_to_timestamp), kind = "values")]
 ///     times: Vec<DateTime<Utc>>
 /// }
 /// ```
 ///
-/// `#[netcdf(map_units = path::to::fn)]` is like `map`, but the function returns
+/// `#[netcdf(map_units(write = path::to::fn))]` is like `map`, but the function returns
 /// `(Out, String)` and the returned string is written as the `units` attribute.
 ///
 /// ```no_run
@@ -411,7 +416,7 @@ pub fn derive_subset(input: TokenStream) -> TokenStream {
 /// struct Data {
 ///     // This is a better version of the above example, because the times variable
 ///     // now gets the right units.
-///     #[netcdf(dimensions("time"), map_units = datetime_to_timestamp, kind = "values")]
+///     #[netcdf(dimensions("time"), map_units(write = datetime_to_timestamp), kind = "values")]
 ///     times: Vec<DateTime<Utc>>
 /// }
 /// ```
@@ -420,6 +425,78 @@ pub fn derive_write_netcdf(input: TokenStream) -> TokenStream {
     write_netcdf::expand(input)
 }
 
+/// Adds a `read_netcdf` associated function that builds a struct from a netCDF file.
+///
+/// The generated function has the signature
+///
+/// ```ignore
+/// pub fn read_netcdf(grp: &netcdf::Group<'_>) -> netcdf::Result<Self>
+/// ```
+///
+/// It is the counterpart to [`WriteNetcdf`] and shares its field attributes:
+/// `rename`, `rename_all`, `kind`, `dimensions`, `attribute`, and `skip` all
+/// mean the same thing in both directions, so one set of annotations serves
+/// both derives. Note that this is an *associated function*, not a method —
+/// there is no `self` yet — so you call it as `Data::read_netcdf(&root)`.
+///
+/// Write-only attributes (`attr`, `describe`, `no_describe`) are ignored here,
+/// and `#[netcdf(skip)]` fields are filled in with [`Default::default()`], which
+/// means a skipped field's type must implement [`Default`].
+///
+/// # Mapping values on the way in
+///
+/// `#[netcdf(map(read = path::to::fn))]` transforms each value after it is read.
+/// The function takes the value from the file *by value* and the struct field
+/// name, and returns a [`netcdf::Result`]:
+/// `fn(NcTy, &str) -> netcdf::Result<Out>`.
+///
+/// Two differences from the write direction are worth noting. There is no
+/// `&Self` argument, because `read_netcdf` is still constructing `Self` when the
+/// function runs. And the function is fallible: the data comes from a file this
+/// program did not necessarily write, so a value that cannot be converted is a
+/// runtime error rather than a bug.
+///
+/// `#[netcdf(map_units(read = path::to::fn))]` additionally passes the
+/// variable's `units` attribute, or `None` when it has none:
+/// `fn(NcTy, &str, Option<&str>) -> netcdf::Result<Out>`.
+///
+/// As with `WriteNetcdf`, the direction is mandatory and `kind` is required
+/// whenever a mapping applies, since the type in the file no longer matches the
+/// field's declared type. A struct that derives both traits names both halves in
+/// one attribute:
+///
+/// ```no_run
+/// use ggg_rs_derive::{ReadNetcdf, WriteNetcdf};
+///
+/// fn frac_to_ppm(_data: &Data, values: &Vec<f64>, _name: &str) -> (Vec<f64>, String) {
+///     (values.iter().map(|v| v * 1.0e6).collect(), "ppm".to_string())
+/// }
+///
+/// fn ppm_to_frac(values: Vec<f64>, name: &str, units: Option<&str>) -> netcdf::Result<Vec<f64>> {
+///     match units {
+///         Some("ppm") => Ok(values.into_iter().map(|v| v / 1.0e6).collect()),
+///         other => Err(netcdf::Error::Str(
+///             format!("field '{name}' expected units of 'ppm', found {other:?}")
+///         )),
+///     }
+/// }
+///
+/// #[derive(ReadNetcdf, WriteNetcdf)]
+/// struct Data {
+///     #[netcdf(
+///         dimensions("time"),
+///         map_units(write = frac_to_ppm, read = ppm_to_frac),
+///         kind = "values"
+///     )]
+///     xluft: Vec<f64>,
+/// }
+/// ```
+///
+/// A `map(...)` that names only one direction is an error in the derive that
+/// needs the other half, so a half-finished mapping is caught at compile time
+/// rather than silently reading or writing the field unmapped. Supplying only
+/// `write = ...` is therefore fine for a struct that derives `WriteNetcdf`
+/// alone, and becomes an error as soon as `ReadNetcdf` is added.
 #[proc_macro_derive(ReadNetcdf, attributes(netcdf))]
 pub fn derive_read_netcdf(input: TokenStream) -> TokenStream {
     read_netcdf::expand(input)

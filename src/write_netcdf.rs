@@ -37,7 +37,8 @@ use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 
 use crate::common_netcdf::{
-    DimList, NcKind, apply_rename_all, infer_kind, kind_from_str, nc_name, validate_dims,
+    DimList, Direction, MapFns, MapSpec, NcKind, apply_rename_all, infer_kind, kind_from_str,
+    nc_name, validate_dims,
 };
 
 // ---------------------------------------------------------------------------
@@ -115,14 +116,18 @@ struct WriteNetcdfField {
     #[darling(default)]
     attribute: bool,
 
-    /// Map the field value before writing: `fn(&Self, &FieldTy, &str) -> Out`.
+    /// Map the field value before writing. The direction is mandatory, since
+    /// reading needs a different function: `map(write = path::to::fn)`, where
+    /// the function is `fn(&Self, &FieldTy, &str) -> Out`. A `read = ...` may
+    /// also be present for `ReadNetcdf`; it is ignored here.
     #[darling(default)]
-    map: Option<syn::Path>,
+    map: Option<MapSpec>,
 
-    /// Like `map`, but also returns the `units` attribute:
+    /// Like `map`, but the write function also returns the `units` attribute:
+    /// `map(write = path::to::fn)` with
     /// `fn(&Self, &FieldTy, &str) -> (Out, String)`.
     #[darling(default)]
-    map_units: Option<syn::Path>,
+    map_units: Option<MapSpec>,
 
     /// Zero or more attributes to attach to the created variable.
     ///
@@ -173,9 +178,10 @@ struct WriteNetcdfInput {
 // Field classification
 // ---------------------------------------------------------------------------
 
-/// Validate a field's attributes and determine its [`WriteKind`]. All errors are
-/// spanned on the field ident so the compiler points at the right place.
-fn resolve_field(f: &WriteNetcdfField) -> Result<NcKind, darling::Error> {
+/// Validate a field's attributes and determine its [`NcKind`] plus the map
+/// functions that apply when writing. All errors are spanned on the field ident
+/// so the compiler points at the right place.
+fn resolve_field(f: &WriteNetcdfField) -> Result<(NcKind, MapFns<'_>), darling::Error> {
     let ident = f.ident.as_ref().unwrap();
     let err = |msg: &str| darling::Error::custom(msg).with_span(ident);
 
@@ -197,7 +203,7 @@ fn resolve_field(f: &WriteNetcdfField) -> Result<NcKind, darling::Error> {
                 "`skip` cannot be combined with any other `netcdf` option",
             ));
         }
-        return Ok(NcKind::Skip);
+        return Ok((NcKind::Skip, MapFns::default()));
     }
 
     // `map` and `map_units` are mutually exclusive.
@@ -223,6 +229,9 @@ fn resolve_field(f: &WriteNetcdfField) -> Result<NcKind, darling::Error> {
         }
     }
 
+    // Narrow each `map(...)` spec down to the function this derive needs.
+    let map_fns = MapFns::resolve(f.map.as_ref(), f.map_units.as_ref(), Direction::Write, ident)?;
+
     // A field written as a group attribute is not a variable, so variable-only
     // options don't apply.
     if f.attribute {
@@ -237,18 +246,18 @@ fn resolve_field(f: &WriteNetcdfField) -> Result<NcKind, darling::Error> {
                 "`attribute` is incompatible with `dimensions`, `kind`, `attr`, `map_units`, and `describe`",
             ));
         }
-        return Ok(NcKind::Attribute);
+        return Ok((NcKind::Attribute, map_fns));
     }
 
     // With a `map`/`map_units` the written type is opaque, so `kind` is required.
-    if f.map.is_some() || f.map_units.is_some() {
+    if map_fns.any() {
         let Some(kind) = &f.kind else {
             return Err(err(
                 "`map`/`map_units` requires an explicit `kind = \"values\"|\"array\"|\"string\"`",
             ));
         };
         let wk = kind_from_str(kind, &f.ty).map_err(|e| e.with_span(ident))?;
-        return validate_dims(wk, has_dims, &f.dimensions, ident).map(|()| wk);
+        return validate_dims(wk, has_dims, &f.dimensions, ident).map(|()| (wk, map_fns));
     }
 
     // Explicit `kind`, else infer from the type.
@@ -257,7 +266,7 @@ fn resolve_field(f: &WriteNetcdfField) -> Result<NcKind, darling::Error> {
     } else {
         infer_kind(&f.ty).map_err(|e| e.with_span(ident))?
     };
-    validate_dims(wk, has_dims, &f.dimensions, ident).map(|()| wk)
+    validate_dims(wk, has_dims, &f.dimensions, ident).map(|()| (wk, map_fns))
 }
 
 // ---------------------------------------------------------------------------
@@ -273,8 +282,8 @@ fn extract_doc(attrs: &[syn::Attribute]) -> Option<String> {
         if !attr.path().is_ident("doc") {
             continue;
         }
-        if let syn::Meta::NameValue(nv) = &attr.meta {
-            if let syn::Expr::Lit(syn::ExprLit {
+        if let syn::Meta::NameValue(nv) = &attr.meta
+            && let syn::Expr::Lit(syn::ExprLit {
                 lit: syn::Lit::Str(s),
                 ..
             }) = &nv.value
@@ -284,7 +293,6 @@ fn extract_doc(attrs: &[syn::Attribute]) -> Option<String> {
                 // stored text isn't uniformly indented.
                 lines.push(line.strip_prefix(' ').unwrap_or(&line).to_string());
             }
-        }
     }
     let text = lines.join(" ");
     let trimmed = text.trim();
@@ -475,18 +483,19 @@ fn field_block(
     write_kind: NcKind,
     name: &str,
     description: Option<(String, String)>,
+    map_fns: MapFns<'_>,
 ) -> TokenStream2 {
     let ident = field.ident.as_ref().unwrap();
-    let mapped = field.map.is_some() || field.map_units.is_some();
+    let mapped = map_fns.any();
 
     // `prelude` computes the value to write; `place` names it afterwards.
     // Without a map we operate directly on `self.<field>`.
-    let (prelude, place): (TokenStream2, TokenStream2) = if let Some(m) = &field.map {
+    let (prelude, place): (TokenStream2, TokenStream2) = if let Some(m) = map_fns.map {
         (
             quote! { let __val = #m(self, &self.#ident, #name); },
             quote!(__val),
         )
-    } else if let Some(m) = &field.map_units {
+    } else if let Some(m) = map_fns.map_units {
         (
             quote! { let (__val, __units) = #m(self, &self.#ident, #name); },
             quote!(__val),
@@ -518,7 +527,7 @@ fn field_block(
                 .extend(quote! { __var.put_attribute(#an, #func(self, &self.#ident, #name))?; });
         }
     }
-    if field.map_units.is_some() {
+    if map_fns.map_units.is_some() {
         attr_stmts.extend(quote! { __var.put_attribute("units", __units)?; });
     }
     let needs_var = !attr_stmts.is_empty();
@@ -622,11 +631,10 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
     // Validate `rename_all` once up front (with an empty field name) so an
     // unknown rule is reported even on an empty struct.
     let mut errors = darling::Error::accumulator();
-    if let Some(rule) = rename_all {
-        if let Err(e) = apply_rename_all("x", rule) {
+    if let Some(rule) = rename_all
+        && let Err(e) = apply_rename_all("x", rule) {
             errors.push(e);
         }
-    }
 
     let mut helpers = HelpersNeeded::default();
     let mut field_blocks: Vec<TokenStream2> = Vec::new();
@@ -634,7 +642,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
     for f in &fields {
         // Resolve the write strategy and the netCDF name, collecting errors so
         // every problem is reported in one compile.
-        let Some(wk) = errors.handle(resolve_field(f)) else {
+        let Some((wk, map_fns)) = errors.handle(resolve_field(f)) else {
             continue;
         };
         if wk == NcKind::Skip {
@@ -655,7 +663,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                 .and_then(|attr| extract_doc(&f.attrs).map(|doc| (attr, doc)))
         };
         helpers.note(wk);
-        field_blocks.push(field_block(f, wk, &name, description));
+        field_blocks.push(field_block(f, wk, &name, description, map_fns));
     }
 
     if let Err(e) = errors.finish() {

@@ -39,7 +39,7 @@ struct Data {
     spectrum: Vec<String>,
 
     // Renamed + mapped value whose units come from the map function.
-    #[netcdf(rename = "xluft_ppm", dimensions("time"), map_units = frac_to_ppm, kind = "values")]
+    #[netcdf(rename = "xluft_ppm", dimensions("time"), map_units(write = frac_to_ppm), kind = "values")]
     xluft: Vec<f64>,
 
     // Written as a global (group) attribute, not a variable.

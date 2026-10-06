@@ -1,0 +1,5 @@
+error: `map` and `map_units` need an explicit direction, because reading and writing require different functions: `map(write = path::to::fn)`, `map(read = path::to::fn)`, or both
+  --> tests/ui/nc_map_not_directional.rs:11:34
+   |
+11 |     #[netcdf(dimensions("time"), map = ident, kind = "values")]
+   |                                  ^^^

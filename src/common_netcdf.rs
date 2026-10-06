@@ -1,4 +1,146 @@
+use darling::FromMeta;
+use darling::ast::NestedMeta;
 use syn::Type;
+
+// ---------------------------------------------------------------------------
+// map / map_units
+// ---------------------------------------------------------------------------
+
+/// Which direction a derive is generating code for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Direction {
+    Read,
+    Write,
+}
+
+impl Direction {
+    /// The key used inside `map(...)` for this direction.
+    fn key(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+        }
+    }
+
+    /// The derive that generates this direction, for error messages.
+    fn derive_name(self) -> &'static str {
+        match self {
+            Self::Read => "ReadNetcdf",
+            Self::Write => "WriteNetcdf",
+        }
+    }
+}
+
+const MAP_FORM_HELP: &str = "`map` and `map_units` need an explicit direction, because reading \
+     and writing require different functions: `map(write = path::to::fn)`, \
+     `map(read = path::to::fn)`, or both";
+
+/// The function pair behind `#[netcdf(map(...))]` / `#[netcdf(map_units(...))]`.
+///
+/// The two directions are *not* interchangeable — they are inverses of each
+/// other, they have different signatures (the read side has no `&Self`, since
+/// it is still building it), and only the read side is fallible — so the
+/// direction is always named explicitly. Either half may be omitted when only
+/// one of the two derives is in use; whichever derive needs the missing half
+/// reports it (see [`MapFns::resolve`]).
+#[derive(Debug, Clone)]
+pub(crate) struct MapSpec {
+    pub(crate) write: Option<syn::Path>,
+    pub(crate) read: Option<syn::Path>,
+}
+
+/// The `write = ...` / `read = ...` body of a `map(...)`, parsed by darling.
+/// Split out from [`MapSpec`] so that `MapSpec`'s own `FromMeta` impl can reject
+/// the non-directional forms with a useful message.
+#[derive(FromMeta)]
+struct MapSpecFields {
+    #[darling(default)]
+    write: Option<syn::Path>,
+    #[darling(default)]
+    read: Option<syn::Path>,
+}
+
+impl FromMeta for MapSpec {
+    /// The only accepted form: `map(write = ..., read = ...)`.
+    fn from_list(items: &[NestedMeta]) -> darling::Result<Self> {
+        let fields = MapSpecFields::from_list(items)?;
+        if fields.write.is_none() && fields.read.is_none() {
+            return Err(darling::Error::custom(MAP_FORM_HELP));
+        }
+        Ok(Self {
+            write: fields.write,
+            read: fields.read,
+        })
+    }
+
+    /// Rejects a bare `map`.
+    fn from_word() -> darling::Result<Self> {
+        Err(darling::Error::custom(MAP_FORM_HELP))
+    }
+
+    /// Rejects the old non-directional `map = path::to::fn` form.
+    fn from_expr(_expr: &syn::Expr) -> darling::Result<Self> {
+        Err(darling::Error::custom(MAP_FORM_HELP))
+    }
+}
+
+/// The map functions that apply to one direction, resolved from the field's
+/// `map(...)` / `map_units(...)` specs.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct MapFns<'a> {
+    pub(crate) map: Option<&'a syn::Path>,
+    pub(crate) map_units: Option<&'a syn::Path>,
+}
+
+impl<'a> MapFns<'a> {
+    /// Pick out the `dir` half of each spec. A spec that exists but does not
+    /// cover `dir` is an error: the field would otherwise be silently read or
+    /// written unmapped, which is almost never what a half-specified `map`
+    /// means. Fields of a struct that derives only one direction are unaffected,
+    /// since the other derive never runs.
+    pub(crate) fn resolve(
+        map: Option<&'a MapSpec>,
+        map_units: Option<&'a MapSpec>,
+        dir: Direction,
+        ident: &syn::Ident,
+    ) -> Result<Self, darling::Error> {
+        Ok(Self {
+            map: direction_fn(map, "map", dir, ident)?,
+            map_units: direction_fn(map_units, "map_units", dir, ident)?,
+        })
+    }
+
+    /// True if this direction maps the field at all.
+    pub(crate) fn any(&self) -> bool {
+        self.map.is_some() || self.map_units.is_some()
+    }
+}
+
+/// Take one direction's function out of an optional spec, erroring when the
+/// spec is present but silent about this direction.
+fn direction_fn<'a>(
+    spec: Option<&'a MapSpec>,
+    attr_name: &str,
+    dir: Direction,
+    ident: &syn::Ident,
+) -> Result<Option<&'a syn::Path>, darling::Error> {
+    let Some(spec) = spec else {
+        return Ok(None);
+    };
+    let chosen = match dir {
+        Direction::Read => spec.read.as_ref(),
+        Direction::Write => spec.write.as_ref(),
+    };
+    match chosen {
+        Some(path) => Ok(Some(path)),
+        None => Err(darling::Error::custom(format!(
+            "`{attr_name}` on this field has no `{} = ...`, which `{}` requires",
+            dir.key(),
+            dir.derive_name()
+        ))
+        .with_span(ident)),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // rename_all
@@ -85,11 +227,10 @@ pub(crate) fn vec_element_type(ty: &Type) -> Option<&Type> {
     if seg.ident != "Vec" {
         return None;
     }
-    if let syn::PathArguments::AngleBracketed(args) = &seg.arguments {
-        if let Some(syn::GenericArgument::Type(t)) = args.args.first() {
+    if let syn::PathArguments::AngleBracketed(args) = &seg.arguments
+        && let Some(syn::GenericArgument::Type(t)) = args.args.first() {
             return Some(t);
         }
-    }
     None
 }
 
@@ -137,15 +278,14 @@ pub(crate) fn infer_kind(ty: &Type) -> Result<NcKind, darling::Error> {
             Ok(NcKind::Values)
         };
     }
-    if let Type::Path(p) = ty {
-        if let Some(seg) = p.path.segments.last() {
+    if let Type::Path(p) = ty
+        && let Some(seg) = p.path.segments.last() {
             if seg.ident.to_string().starts_with("Array") {
                 return Ok(NcKind::Array);
             }
             // Numeric/bool scalars fall through to `Scalar`.
             return Ok(NcKind::Scalar);
         }
-    }
     Err(darling::Error::custom(
         "couldn't infer how to write this field — annotate with \
          #[netcdf(kind = \"values\"|\"array\"|\"string\")], #[netcdf(attribute)], \

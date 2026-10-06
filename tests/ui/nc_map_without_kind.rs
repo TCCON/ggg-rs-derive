@@ -6,7 +6,7 @@ fn ident(_s: &Bad, v: &Vec<f64>, _n: &str) -> Vec<f64> {
 
 #[derive(WriteNetcdf)]
 struct Bad {
-    #[netcdf(dimensions("time"), map = ident)]
+    #[netcdf(dimensions("time"), map(write = ident))]
     values: Vec<f64>,
 }
 
