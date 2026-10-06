@@ -35,19 +35,14 @@ use darling::{FromDeriveInput, FromField, FromMeta, ast};
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
-use syn::Type;
+
+use crate::common_netcdf::{
+    DimList, NcKind, apply_rename_all, infer_kind, kind_from_str, nc_name, validate_dims,
+};
 
 // ---------------------------------------------------------------------------
 // darling input models
 // ---------------------------------------------------------------------------
-
-/// A list of dimension names written as `#[netcdf(dimensions("time", "level"))]`.
-///
-/// darling implements `FromMeta` for `Vec<T>` only for a few concrete element
-/// types (not `String`), so we wrap the list in a newtype and parse each entry
-/// ourselves via `FromMeta::from_list`.
-#[derive(Debug, Clone, Default)]
-struct DimList(Vec<String>);
 
 impl FromMeta for DimList {
     fn from_list(items: &[NestedMeta]) -> darling::Result<Self> {
@@ -178,106 +173,9 @@ struct WriteNetcdfInput {
 // Field classification
 // ---------------------------------------------------------------------------
 
-/// How a field's value is written to netCDF.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum WriteKind {
-    /// 1-D `Vec`/slice via `VariableMut::put_values`.
-    Values,
-    /// ndarray `Array*` via `VariableMut::put`.
-    Array,
-    /// A single string via `VariableMut::put_string`.
-    StringScalar,
-    /// A `Vec<String>` via a loop of `VariableMut::put_string`.
-    StringVec,
-    /// A scalar (number/bool) via `VariableMut::put_value`.
-    Scalar,
-    /// Written as a group attribute rather than a variable.
-    Attribute,
-    /// Not written.
-    Skip,
-}
-
-/// Pull the first generic argument `T` out of `Vec<T>` (used to distinguish
-/// `Vec<String>` from `Vec<f64>` during inference).
-fn vec_element_type(ty: &Type) -> Option<&Type> {
-    let Type::Path(type_path) = ty else {
-        return None;
-    };
-    let seg = type_path.path.segments.last()?;
-    if seg.ident != "Vec" {
-        return None;
-    }
-    if let syn::PathArguments::AngleBracketed(args) = &seg.arguments {
-        if let Some(syn::GenericArgument::Type(t)) = args.args.first() {
-            return Some(t);
-        }
-    }
-    None
-}
-
-/// True if `ty` is `String`, `&str`, or `&String` — i.e. a scalar string.
-fn is_scalar_string(ty: &Type) -> bool {
-    match ty {
-        Type::Reference(r) => is_scalar_string(&r.elem),
-        Type::Path(p) => p
-            .path
-            .segments
-            .last()
-            .is_some_and(|s| s.ident == "String" || s.ident == "str"),
-        _ => false,
-    }
-}
-
-/// Map an explicit `kind = "..."` string to a [`WriteKind`], using the field's
-/// declared type only to decide scalar-vs-vec for `"string"`.
-fn kind_from_str(kind: &str, ty: &Type) -> Result<WriteKind, darling::Error> {
-    match kind {
-        "values" => Ok(WriteKind::Values),
-        "array" => Ok(WriteKind::Array),
-        "string" => {
-            if is_scalar_string(ty) {
-                Ok(WriteKind::StringScalar)
-            } else {
-                Ok(WriteKind::StringVec)
-            }
-        }
-        other => Err(darling::Error::custom(format!(
-            "unknown kind \"{other}\", expected \"values\", \"array\", or \"string\""
-        ))),
-    }
-}
-
-/// Infer a [`WriteKind`] from the field's declared type.
-fn infer_kind(ty: &Type) -> Result<WriteKind, darling::Error> {
-    if is_scalar_string(ty) {
-        return Ok(WriteKind::StringScalar);
-    }
-    if let Some(elem) = vec_element_type(ty) {
-        return if is_scalar_string(elem) {
-            Ok(WriteKind::StringVec)
-        } else {
-            Ok(WriteKind::Values)
-        };
-    }
-    if let Type::Path(p) = ty {
-        if let Some(seg) = p.path.segments.last() {
-            if seg.ident.to_string().starts_with("Array") {
-                return Ok(WriteKind::Array);
-            }
-            // Numeric/bool scalars fall through to `Scalar`.
-            return Ok(WriteKind::Scalar);
-        }
-    }
-    Err(darling::Error::custom(
-        "couldn't infer how to write this field — annotate with \
-         #[netcdf(kind = \"values\"|\"array\"|\"string\")], #[netcdf(attribute)], \
-         or #[netcdf(skip)]",
-    ))
-}
-
 /// Validate a field's attributes and determine its [`WriteKind`]. All errors are
 /// spanned on the field ident so the compiler points at the right place.
-fn resolve_field(f: &WriteNetcdfField) -> Result<WriteKind, darling::Error> {
+fn resolve_field(f: &WriteNetcdfField) -> Result<NcKind, darling::Error> {
     let ident = f.ident.as_ref().unwrap();
     let err = |msg: &str| darling::Error::custom(msg).with_span(ident);
 
@@ -299,7 +197,7 @@ fn resolve_field(f: &WriteNetcdfField) -> Result<WriteKind, darling::Error> {
                 "`skip` cannot be combined with any other `netcdf` option",
             ));
         }
-        return Ok(WriteKind::Skip);
+        return Ok(NcKind::Skip);
     }
 
     // `map` and `map_units` are mutually exclusive.
@@ -339,7 +237,7 @@ fn resolve_field(f: &WriteNetcdfField) -> Result<WriteKind, darling::Error> {
                 "`attribute` is incompatible with `dimensions`, `kind`, `attr`, `map_units`, and `describe`",
             ));
         }
-        return Ok(WriteKind::Attribute);
+        return Ok(NcKind::Attribute);
     }
 
     // With a `map`/`map_units` the written type is opaque, so `kind` is required.
@@ -360,79 +258,6 @@ fn resolve_field(f: &WriteNetcdfField) -> Result<WriteKind, darling::Error> {
         infer_kind(&f.ty).map_err(|e| e.with_span(ident))?
     };
     validate_dims(wk, has_dims, &f.dimensions, ident).map(|()| wk)
-}
-
-/// Enforce the dimension-count rules that depend on the write strategy.
-fn validate_dims(
-    wk: WriteKind,
-    has_dims: bool,
-    dims: &Option<DimList>,
-    ident: &syn::Ident,
-) -> Result<(), darling::Error> {
-    let err = |msg: &str| darling::Error::custom(msg).with_span(ident);
-    match wk {
-        WriteKind::Values | WriteKind::StringVec => {
-            if dims.as_ref().is_some_and(|d| d.0.len() > 1) {
-                return Err(err("a 1-D field accepts at most one dimension name"));
-            }
-        }
-        WriteKind::Scalar | WriteKind::StringScalar => {
-            if has_dims {
-                return Err(err("a scalar field cannot have dimensions"));
-            }
-        }
-        // Arrays accept any number of names; anything else has been handled.
-        _ => {}
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// rename_all
-// ---------------------------------------------------------------------------
-
-/// Apply a serde-style `rename_all` rule to a (snake_case) Rust field name.
-fn apply_rename_all(field: &str, rule: &str) -> Result<String, darling::Error> {
-    let words: Vec<&str> = field.split('_').filter(|w| !w.is_empty()).collect();
-    let upper_first = |w: &str| {
-        let mut c = w.chars();
-        match c.next() {
-            Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
-            None => String::new(),
-        }
-    };
-    Ok(match rule {
-        "lowercase" => field.replace('_', "").to_lowercase(),
-        "UPPERCASE" => field.replace('_', "").to_uppercase(),
-        "snake_case" => field.to_string(),
-        "SCREAMING_SNAKE_CASE" => field.to_uppercase(),
-        "kebab-case" => field.replace('_', "-"),
-        "SCREAMING-KEBAB-CASE" => field.to_uppercase().replace('_', "-"),
-        "PascalCase" => words.iter().map(|w| upper_first(w)).collect(),
-        "camelCase" => {
-            let mut it = words.iter();
-            let head = it.next().map(|w| w.to_lowercase()).unwrap_or_default();
-            head + &it.map(|w| upper_first(w)).collect::<String>()
-        }
-        other => {
-            return Err(darling::Error::custom(format!(
-                "unknown rename_all rule \"{other}\""
-            )));
-        }
-    })
-}
-
-/// Resolve a field's final netCDF name: `rename` wins, then `rename_all`, then
-/// the raw field name.
-fn nc_name(f: &WriteNetcdfField, rename_all: Option<&str>) -> Result<String, darling::Error> {
-    if let Some(name) = &f.rename {
-        return Ok(name.clone());
-    }
-    let field = f.ident.as_ref().unwrap().to_string();
-    match rename_all {
-        Some(rule) => apply_rename_all(&field, rule),
-        None => Ok(field),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -512,24 +337,24 @@ struct HelpersNeeded {
 }
 
 impl HelpersNeeded {
-    fn note(&mut self, wk: WriteKind) {
+    fn note(&mut self, wk: NcKind) {
         match wk {
-            WriteKind::Values => {
+            NcKind::Values => {
                 self.values = true;
                 self.ensure_dim = true;
             }
-            WriteKind::StringVec => {
+            NcKind::StringVec => {
                 self.strings = true;
                 self.ensure_dim = true;
             }
-            WriteKind::Array => {
+            NcKind::Array => {
                 self.array = true;
                 self.ensure_dim = true;
                 self.ensure_dims = true;
             }
-            WriteKind::Scalar => self.scalar = true,
-            WriteKind::StringScalar => self.string_scalar = true,
-            WriteKind::Attribute | WriteKind::Skip => {}
+            NcKind::Scalar => self.scalar = true,
+            NcKind::StringScalar => self.string_scalar = true,
+            NcKind::Attribute | NcKind::Skip => {}
         }
     }
 
@@ -646,22 +471,22 @@ impl HelpersNeeded {
 /// Build the `{ ... }` statement block that writes one field. `description`, if
 /// present, is the `(attribute name, text)` to attach to the created variable.
 fn field_block(
-    f: &WriteNetcdfField,
-    wk: WriteKind,
+    field: &WriteNetcdfField,
+    write_kind: NcKind,
     name: &str,
     description: Option<(String, String)>,
 ) -> TokenStream2 {
-    let ident = f.ident.as_ref().unwrap();
-    let mapped = f.map.is_some() || f.map_units.is_some();
+    let ident = field.ident.as_ref().unwrap();
+    let mapped = field.map.is_some() || field.map_units.is_some();
 
     // `prelude` computes the value to write; `place` names it afterwards.
     // Without a map we operate directly on `self.<field>`.
-    let (prelude, place): (TokenStream2, TokenStream2) = if let Some(m) = &f.map {
+    let (prelude, place): (TokenStream2, TokenStream2) = if let Some(m) = &field.map {
         (
             quote! { let __val = #m(self, &self.#ident, #name); },
             quote!(__val),
         )
-    } else if let Some(m) = &f.map_units {
+    } else if let Some(m) = &field.map_units {
         (
             quote! { let (__val, __units) = #m(self, &self.#ident, #name); },
             quote!(__val),
@@ -684,7 +509,7 @@ fn field_block(
     if let Some((desc_attr, desc_text)) = &description {
         attr_stmts.extend(quote! { __var.put_attribute(#desc_attr, #desc_text)?; });
     }
-    for a in &f.var_attrs {
+    for a in &field.var_attrs {
         let an = &a.name;
         if let Some(v) = &a.value {
             attr_stmts.extend(quote! { __var.put_attribute(#an, #v)?; });
@@ -693,21 +518,21 @@ fn field_block(
                 .extend(quote! { __var.put_attribute(#an, #func(self, &self.#ident, #name))?; });
         }
     }
-    if f.map_units.is_some() {
+    if field.map_units.is_some() {
         attr_stmts.extend(quote! { __var.put_attribute("units", __units)?; });
     }
     let needs_var = !attr_stmts.is_empty();
 
     // The dimension-name list literal (`["time", "level"]`), if given explicitly.
-    let dim_names: Vec<String> = f
+    let dim_names: Vec<String> = field
         .dimensions
         .as_ref()
         .map(|d| d.0.clone())
         .unwrap_or_default();
 
     // Produce the `helper(...)` call that creates + writes the variable.
-    let call: TokenStream2 = match wk {
-        WriteKind::Values => {
+    let call: TokenStream2 = match write_kind {
+        NcKind::Values => {
             let d0 = dim_names
                 .first()
                 .cloned()
@@ -717,7 +542,7 @@ fn field_block(
                 __put_values(grp, #name, &[#d0], & #place)
             }}
         }
-        WriteKind::StringVec => {
+        NcKind::StringVec => {
             let d0 = dim_names
                 .first()
                 .cloned()
@@ -727,7 +552,7 @@ fn field_block(
                 __put_strings(grp, #name, &[#d0], & #place)
             }}
         }
-        WriteKind::Array => {
+        NcKind::Array => {
             if dim_names.is_empty() {
                 // No names given: derive one per axis at runtime as `name_0`, ...
                 quote! {{
@@ -746,16 +571,16 @@ fn field_block(
                 }}
             }
         }
-        WriteKind::StringScalar => quote! { __put_string_scalar(grp, #name, & #place) },
-        WriteKind::Scalar => quote! { __put_scalar(grp, #name, #owned) },
-        WriteKind::Attribute => {
+        NcKind::StringScalar => quote! { __put_string_scalar(grp, #name, & #place) },
+        NcKind::Scalar => quote! { __put_scalar(grp, #name, #owned) },
+        NcKind::Attribute => {
             // A group attribute: no variable, no dimensions.
             return quote! {{
                 #prelude
                 grp.add_attribute(#name, #owned)?;
             }};
         }
-        WriteKind::Skip => unreachable!("skip fields are filtered out before codegen"),
+        NcKind::Skip => unreachable!("skip fields are filtered out before codegen"),
     };
 
     // Bind `__var` only when there are attributes to attach (avoids unused
@@ -812,14 +637,18 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
         let Some(wk) = errors.handle(resolve_field(f)) else {
             continue;
         };
-        if wk == WriteKind::Skip {
+        if wk == NcKind::Skip {
             continue;
         }
-        let Some(name) = errors.handle(nc_name(f, rename_all)) else {
+        let Some(name) = errors.handle(nc_name(
+            f.ident.as_ref().unwrap(),
+            f.rename.as_deref(),
+            rename_all,
+        )) else {
             continue;
         };
         // Descriptions only apply to variables, not to group-attribute fields.
-        let description = if wk == WriteKind::Attribute {
+        let description = if wk == NcKind::Attribute {
             None
         } else {
             resolve_describe(parsed.describe.as_ref(), f.describe.as_ref(), f.no_describe)

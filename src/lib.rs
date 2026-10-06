@@ -1,5 +1,7 @@
 use proc_macro::TokenStream;
 
+mod common_netcdf;
+mod read_netcdf;
 mod subset;
 mod write_netcdf;
 
@@ -416,4 +418,9 @@ pub fn derive_subset(input: TokenStream) -> TokenStream {
 #[proc_macro_derive(WriteNetcdf, attributes(netcdf))]
 pub fn derive_write_netcdf(input: TokenStream) -> TokenStream {
     write_netcdf::expand(input)
+}
+
+#[proc_macro_derive(ReadNetcdf, attributes(netcdf))]
+pub fn derive_read_netcdf(input: TokenStream) -> TokenStream {
+    read_netcdf::expand(input)
 }

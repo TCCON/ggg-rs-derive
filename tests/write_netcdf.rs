@@ -14,7 +14,8 @@ fn frac_to_ppm(_data: &Data, values: &Vec<f64>, _name: &str) -> (Vec<f64>, Strin
 
 /// `attr(func = ...)` hook: build a long_name from the field's netCDF name.
 fn make_long_name(_data: &Data, _values: &Vec<f64>, name: &str) -> String {
-    format!("data for {name}")
+    let name = format!("data for {name}");
+    name
 }
 
 #[derive(WriteNetcdf)]
