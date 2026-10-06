@@ -470,7 +470,7 @@ fn resolve_field(field: &ReadNetcdfField) -> Result<(NcKind, MapFns<'_>), darlin
     // A field written as a group attribute is not a variable, so variable-only
     // options don't apply.
     if field.attribute {
-        if field.kind.is_some() || field.map_units.is_some() {
+        if field.kind.is_some() || field.map_units.is_some() || has_dims {
             return Err(err(
                 "`attribute` is incompatible with `dimensions`, `kind`, `attr`, `map_units`, and `describe`",
             ));

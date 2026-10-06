@@ -1,0 +1,5 @@
+error: `attribute` is incompatible with `dimensions`, `kind`, `attr`, `map_units`, and `describe`
+ --> tests/ui/nc_read_attribute_reject_dims.rs:6:5
+  |
+6 |     att_val: String,
+  |     ^^^^^^^
