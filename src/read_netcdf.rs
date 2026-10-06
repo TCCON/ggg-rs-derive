@@ -62,6 +62,9 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
         if map_fns.map_units.is_some() {
             helpers.get_units = true;
         }
+        if f.dimensions.is_some() {
+            helpers.check_dims = true;
+        }
         field_blocks.push(field_block(f, read_kind, &name, map_fns));
         field_names.push(fieldname);
     }
@@ -147,6 +150,10 @@ struct ReadNetcdfField {
 
 #[derive(Debug, Default)]
 struct HelpersNeeded {
+    /// true if a field needs a helper to confirm that its dimensions
+    /// match what is expected
+    check_dims: bool,
+
     /// true if a field needs a helper to read a vector of values
     values: bool,
 
@@ -188,7 +195,32 @@ impl HelpersNeeded {
         let mut out = TokenStream2::new();
         // Tip: to help write/edit a function, make a regular function annotated with `#[cfg(test)]`
         // so it resolved netcdf and ndarray, work on it outside the quote!, then paste it into the quote!.
+        // Alternatively, if this code is added in a test, the IDE will pick up error (but not autocomplete).
+        if self.check_dims {
+            out.extend(quote! {
+                fn __check_dims<'g>(
+                    g: &'g ::netcdf::Group<'_>,
+                    name: &str,
+                    dims: &[&str],
+                ) -> ::netcdf::Result<()> {
+                    let var = g
+                        .variable(name)
+                        .ok_or_else(|| ::netcdf::Error::NotFound(format!("variable: '{name}'")))?;
 
+                    let vardims: Vec<String> = var.dimensions().iter().map(|d| d.name()).collect();
+                    let matches = vardims.len() == dims.len() && vardims.iter().zip(dims).all(|(got, want)| got.as_str() == *want);
+                    if matches {
+                        Ok(())
+                    } else {
+                        let expected = dims.join(", ");
+                        let actual = vardims.join(", ");
+                        Err(::netcdf::Error::Str(format!(
+                            "Variable '{name}' had wrong dimension number or names: expected [{expected}], got [{actual}]"
+                        )))
+                    }
+                }
+            });
+        }
         if self.values {
             out.extend(quote! {
                 // Return a vector of values, 
@@ -348,7 +380,6 @@ impl HelpersNeeded {
                         .variable(name)
                         .ok_or_else(|| ::netcdf::Error::NotFound(format!("variable: {name}")))?;
 
-                    // TODO: check dimensionality - not sure if a scalar string variable will have 0 or 1 dimension(s)
                     let s = var.get_string(())?;
                     Ok(s)
                 }
@@ -522,10 +553,22 @@ fn field_block(
         quote!(__val)
     };
 
-    quote! {
-        let #fieldname = {
-            let __val = #call?;
-            #remap
-        };
+    // If we are to check dimensions, include that before we read the variable
+    if let Some(dims) = field.dimensions.as_ref() {
+        let expected: Vec<&str> = dims.0.iter().map(|d| d.as_str()).collect();
+        quote! {
+            __check_dims(grp, #varname, &[#(#expected),*])?;
+                let #fieldname = {
+                let __val = #call?;
+                #remap
+            };
+        }
+    } else {
+        quote! {
+            let #fieldname = {
+                let __val = #call?;
+                #remap
+            };
+        }
     }
 }

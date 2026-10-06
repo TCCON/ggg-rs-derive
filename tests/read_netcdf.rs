@@ -192,3 +192,37 @@ fn test_read_custom_unit_attr() {
     let read = CustUnitAttr::read_netcdf(&root).unwrap();
     assert_eq!(read.xluft, cust.xluft);
 }
+
+// We'll use this to read back in a CustUnitAttr but expect the wrong dimension name
+#[derive(Debug, ReadNetcdf)]
+struct DimNameMismatchIn {
+    #[allow(unused)]
+    #[netcdf(dimensions("spectrum"))]
+    xluft_ppm: Vec<f64>,
+}
+
+#[test]
+fn test_check_dims() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("root.nc");
+    let cust = CustUnitAttr {
+        xluft: vec![1.0, 0.5, 0.25],
+    };
+
+    {
+        let mut file = netcdf::create(&path).unwrap();
+        let mut root = file.root_mut().unwrap();
+        cust.write_netcdf(&mut root).unwrap();
+    }
+
+    let file = netcdf::open(&path).unwrap();
+    let root = file.root().unwrap();
+    let read_res = DimNameMismatchIn::read_netcdf(&root);
+    let expected_error =
+        "Variable 'xluft_ppm' had wrong dimension number or names: expected [spectrum], got [time]";
+    if let Err(netcdf::Error::Str(msg)) = read_res {
+        assert_eq!(msg, expected_error)
+    } else {
+        assert!(false, "Got unexpected error type or no error");
+    }
+}
