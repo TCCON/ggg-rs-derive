@@ -1,0 +1,5 @@
+error: `scale_offset` cannot be combined with `map`/`map_units`: the mapped type is opaque, so there is no way to check that it is floating-point. Pack inside the map function instead.
+  --> tests/ui/nc_scale_offset_with_map.rs:18:5
+   |
+18 |     xco2: Vec<f64>,
+   |     ^^^^

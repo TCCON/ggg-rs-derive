@@ -37,8 +37,8 @@ use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 
 use crate::common_netcdf::{
-    DimList, Direction, MapFns, MapSpec, NcKind, apply_rename_all, infer_kind, kind_from_str,
-    nc_name, validate_dims,
+    DimList, Direction, FloatTy, MapFns, MapSpec, NcKind, ScaleOffsetSpec, apply_rename_all,
+    float_element_type, infer_kind, kind_from_str, nc_name, not_float_message, validate_dims,
 };
 
 // ---------------------------------------------------------------------------
@@ -129,6 +129,27 @@ struct WriteNetcdfField {
     #[darling(default)]
     map_units: Option<MapSpec>,
 
+    /// Pack the field into a smaller on-disk type:
+    /// `scale_offset(scale = 0.01, offset = 400.0, nc_type = "i16")`. Values are
+    /// stored as `(value - offset) / scale`, rounded, and the `scale_factor` /
+    /// `add_offset` attributes are written so a reader can invert it. `scale` and
+    /// `offset` are individually optional; `nc_type` is not.
+    #[darling(default)]
+    scale_offset: Option<ScaleOffsetSpec>,
+
+    /// Accepted and ignored: `unpack` and `on_fill` are `ReadNetcdf` options.
+    /// Both derives read the same `netcdf` attribute, so each has to tolerate
+    /// the other's keys — otherwise a struct deriving both could not be
+    /// annotated at all. Declared explicitly rather than using
+    /// `allow_unknown_fields` so that genuine typos stay an error.
+    #[darling(default)]
+    #[allow(dead_code)]
+    unpack: Option<crate::common_netcdf::UnpackSpec>,
+
+    #[darling(default)]
+    #[allow(dead_code)]
+    on_fill: Option<crate::common_netcdf::OnFill>,
+
     /// Zero or more attributes to attach to the created variable.
     ///
     /// Not named `attrs`: darling reserves that field name on `FromField`
@@ -172,6 +193,16 @@ struct WriteNetcdfInput {
     /// fields can override the name or opt out with `#[netcdf(no_describe)]`.
     #[darling(default)]
     describe: Option<Override<String>>,
+
+    /// Accepted and ignored: container-level `ReadNetcdf` options. See the note
+    /// on `WriteNetcdfField::unpack`.
+    #[darling(default)]
+    #[allow(dead_code)]
+    unpack: Option<crate::common_netcdf::UnpackSpec>,
+
+    #[darling(default)]
+    #[allow(dead_code)]
+    on_fill: Option<crate::common_netcdf::OnFill>,
 }
 
 // ---------------------------------------------------------------------------
@@ -198,6 +229,7 @@ fn resolve_field(f: &WriteNetcdfField) -> Result<(NcKind, MapFns<'_>), darling::
             || !f.var_attrs.is_empty()
             || f.describe.is_some()
             || f.no_describe
+            || f.scale_offset.is_some()
         {
             return Err(err(
                 "`skip` cannot be combined with any other `netcdf` option",
@@ -237,6 +269,25 @@ fn resolve_field(f: &WriteNetcdfField) -> Result<(NcKind, MapFns<'_>), darling::
         ident,
     )?;
 
+    // Packing rewrites the values and changes the on-disk type, so it needs to
+    // know it is dealing with floats. A `map` makes the written type opaque, so
+    // the check cannot be made and the combination is refused rather than guessed
+    // at.
+    if f.scale_offset.is_some() {
+        if map_fns.any() {
+            return Err(err(
+                "`scale_offset` cannot be combined with `map`/`map_units`: the mapped type \
+                 is opaque, so there is no way to check that it is floating-point. Pack \
+                 inside the map function instead.",
+            ));
+        }
+        if float_element_type(&f.ty).is_none() {
+            return Err(
+                darling::Error::custom(not_float_message("scale_offset", &f.ty)).with_span(ident),
+            );
+        }
+    }
+
     // A field written as a group attribute is not a variable, so variable-only
     // options don't apply.
     if f.attribute {
@@ -246,9 +297,10 @@ fn resolve_field(f: &WriteNetcdfField) -> Result<(NcKind, MapFns<'_>), darling::
             || f.map_units.is_some()
             || f.describe.is_some()
             || f.no_describe
+            || f.scale_offset.is_some()
         {
             return Err(err(
-                "`attribute` is incompatible with `dimensions`, `kind`, `attr`, `map_units`, and `describe`",
+                "`attribute` is incompatible with `dimensions`, `kind`, `attr`, `map_units`, `scale_offset`, and `describe`",
             ));
         }
         return Ok((NcKind::Attribute, map_fns));
@@ -271,6 +323,9 @@ fn resolve_field(f: &WriteNetcdfField) -> Result<(NcKind, MapFns<'_>), darling::
     } else {
         infer_kind(&f.ty).map_err(|e| e.with_span(ident))?
     };
+    if f.scale_offset.is_some() && matches!(wk, NcKind::StringScalar | NcKind::StringVec) {
+        return Err(err("`scale_offset` does not apply to a string field"));
+    }
     validate_dims(wk, has_dims, &f.dimensions, ident).map(|()| (wk, map_fns))
 }
 
@@ -481,6 +536,92 @@ impl HelpersNeeded {
 // Per-field code generation
 // ---------------------------------------------------------------------------
 
+/// Statements that turn `place` into a `__packed` value of the requested on-disk
+/// type, following the netCDF attribute convention `packed = (value - add_offset)
+/// / scale_factor`.
+///
+/// Emitted inline rather than as a shared helper: both the float type and the
+/// storage type are known here, so no generics, trait bounds, or
+/// `HelpersNeeded` bookkeeping are required.
+fn pack_prelude(
+    so: &ScaleOffsetSpec,
+    float_ty: FloatTy,
+    write_kind: NcKind,
+    place: &TokenStream2,
+    name: &str,
+) -> TokenStream2 {
+    let out_ty = so.nc_type.rust_ty();
+    let out_ty_name = so.nc_type.name();
+    let float = syn::Ident::new(float_ty.name(), proc_macro2::Span::call_site());
+
+    // Subtract the offset and divide by the scale, skipping whichever was not
+    // given rather than multiplying by 1 or adding 0.
+    let mut adjust = TokenStream2::new();
+    if let Some(offset) = so.offset {
+        adjust.extend(quote! { __p -= #offset as #float; });
+    }
+    if let Some(scale) = so.scale {
+        adjust.extend(quote! { __p /= #scale as #float; });
+    }
+
+    // Integers need rounding and a range check. `round_ties_even` rather than
+    // `round` so packing agrees with `numpy.around`, which is what
+    // netCDF4-python's `_pack` uses, on exact .5 boundaries. The explicit range
+    // check is because Rust's float->int cast saturates silently, which would
+    // turn an out-of-range value into a plausible-looking extreme.
+    // Note the extra braces: this is interpolated into `Ok(#finish)`, so it has
+    // to be a block *expression*, not a run of statements.
+    let finish = if so.nc_type.is_integer() {
+        quote! {{
+            let __p = __p.round_ties_even();
+            if __p < #out_ty::MIN as #float || __p > #out_ty::MAX as #float {
+                return Err(::netcdf::Error::Str(format!(
+                    "value {__v} of variable '{}' does not fit in {} once packed \
+                     (packed value {__p} is outside {}..={})",
+                    #name, #out_ty_name, #out_ty::MIN, #out_ty::MAX
+                )));
+            }
+            __p as #out_ty
+        }}
+    } else {
+        quote! { __p as #out_ty }
+    };
+
+    // `?` inside a closure would return from the closure, so pack through a
+    // `Result`-yielding map and collect, which propagates out of `write_netcdf`.
+    let pack_one = quote! {
+        |&__v: &#float| -> ::netcdf::Result<#out_ty> {
+            let mut __p = __v;
+            #adjust
+            Ok(#finish)
+        }
+    };
+
+    match write_kind {
+        NcKind::Array => quote! {
+            // `.iter()` yields logical order, which is what `from_shape_vec` expects.
+            let __packed_vec = #place
+                .iter()
+                .map(#pack_one)
+                .collect::<::netcdf::Result<::std::vec::Vec<#out_ty>>>()?;
+            let __packed = ::ndarray::Array::from_shape_vec(#place.raw_dim(), __packed_vec)
+                .map_err(|e| ::netcdf::Error::Str(format!(
+                    "could not rebuild packed array for variable '{}': {e}", #name
+                )))?;
+        },
+        NcKind::Scalar => quote! {
+            let __packed = (#pack_one)(& #place)?;
+        },
+        // `Values`; the string and attribute kinds were rejected in `resolve_field`.
+        _ => quote! {
+            let __packed = #place
+                .iter()
+                .map(#pack_one)
+                .collect::<::netcdf::Result<::std::vec::Vec<#out_ty>>>()?;
+        },
+    }
+}
+
 /// Build the `{ ... }` statement block that writes one field. `description`, if
 /// present, is the `(attribute name, text)` to attach to the created variable.
 fn field_block(
@@ -495,7 +636,7 @@ fn field_block(
 
     // `prelude` computes the value to write; `place` names it afterwards.
     // Without a map we operate directly on `self.<field>`.
-    let (prelude, place): (TokenStream2, TokenStream2) = if let Some(m) = map_fns.map {
+    let (mut prelude, mut place): (TokenStream2, TokenStream2) = if let Some(m) = map_fns.map {
         (
             quote! { let __val = #m(self, &self.#ident, #name); },
             quote!(__val),
@@ -509,8 +650,21 @@ fn field_block(
         (quote! {}, quote!(self.#ident))
     };
 
+    // Packing hooks into the same seam as `map`: rewrite the values in the
+    // prelude and point `place` at the result. Because `__put_values::<T>` infers
+    // `T` from its slice, handing it a `Vec<i16>` is all it takes to get
+    // `add_variable::<i16>` — none of the `__put_*` helpers need to know.
+    if let Some(so) = &field.scale_offset {
+        // `resolve_field` has already rejected a non-float field here.
+        let float_ty = float_element_type(&field.ty).unwrap_or(FloatTy::F64);
+        prelude.extend(pack_prelude(so, float_ty, write_kind, &place, name));
+        place = quote!(__packed);
+    }
+
     // A scalar/attribute value must be owned; clone only when we can't move.
-    let owned = if mapped {
+    let owned = if field.scale_offset.is_some() {
+        quote!(__packed)
+    } else if mapped {
         quote!(__val)
     } else {
         quote!(self.#ident.clone())
@@ -522,6 +676,22 @@ fn field_block(
     // could intentionally shadow it if desired.
     if let Some((desc_attr, desc_text)) = &description {
         attr_stmts.extend(quote! { __var.put_attribute(#desc_attr, #desc_text)?; });
+    }
+    // The packing attributes go on before any explicit `attr(...)`, for the same
+    // reason: a hand-written `attr(name = "scale_factor", ...)` can still shadow
+    // them. They are written in the field's own float type, since the convention
+    // is that they match the *unpacked* data rather than the stored data.
+    if let Some(so) = &field.scale_offset {
+        let float = syn::Ident::new(
+            float_element_type(&field.ty).unwrap_or(FloatTy::F64).name(),
+            proc_macro2::Span::call_site(),
+        );
+        if let Some(scale) = so.scale {
+            attr_stmts.extend(quote! { __var.put_attribute("scale_factor", #scale as #float)?; });
+        }
+        if let Some(offset) = so.offset {
+            attr_stmts.extend(quote! { __var.put_attribute("add_offset", #offset as #float)?; });
+        }
     }
     for a in &field.var_attrs {
         let an = &a.name;

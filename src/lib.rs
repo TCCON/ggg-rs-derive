@@ -422,6 +422,45 @@ pub fn derive_subset(input: TokenStream) -> TokenStream {
 ///     times: Vec<DateTime<Utc>>
 /// }
 /// ```
+///
+/// `#[netcdf(scale_offset(scale = .., offset = .., nc_type = ".."))]` packs the
+/// field into a smaller on-disk type, following the netCDF attribute conventions.
+/// Values are stored as `(value - offset) / scale`, and the `scale_factor` and
+/// `add_offset` attributes are written so that a reader — including
+/// [`ReadNetcdf`], which inverts this automatically — can recover the original
+/// numbers.
+///
+/// `scale` and `offset` are individually optional, but at least one is required.
+/// `nc_type` is mandatory and names the packed type (`"i8"`, `"u8"`, `"i16"`,
+/// `"u16"`, `"i32"`, `"u32"`, `"i64"`, `"u64"`, `"f32"`, `"f64"`): without it the
+/// variable would keep the field's own type and packing would save nothing.
+///
+/// ```no_run
+/// use ggg_rs_derive::WriteNetcdf;
+///
+/// #[derive(WriteNetcdf)]
+/// struct Data {
+///     // Stored as `short xco2(time)` with 0.01 ppm resolution around a 400 ppm
+///     // baseline — a quarter the size of the f64 values in memory.
+///     #[netcdf(
+///         dimensions("time"),
+///         scale_offset(scale = 0.01, offset = 400.0, nc_type = "i16")
+///     )]
+///     xco2: Vec<f64>,
+/// }
+/// ```
+///
+/// Three things worth knowing:
+///
+/// * The field's element type must be `f32` or `f64`. Packing an integer field
+///   has nothing to divide, so it is a compile error, as is a type alias the
+///   macro cannot see inside (use a concrete `Vec<f64>` or `Array<f64, _>`).
+/// * Values are rounded with `round_ties_even`, matching `numpy.around` as used
+///   by netCDF4-python's packing, and a value that does not fit the packed type
+///   is a runtime error rather than a silently clamped one.
+/// * `scale_offset` cannot be combined with `map`/`map_units`: a mapped value's
+///   type is opaque to the macro, so it cannot check that what gets written is
+///   floating-point. Pack inside the map function instead.
 #[proc_macro_derive(WriteNetcdf, attributes(netcdf))]
 pub fn derive_write_netcdf(input: TokenStream) -> TokenStream {
     write_netcdf::expand(input)
@@ -501,6 +540,97 @@ pub fn derive_write_netcdf(input: TokenStream) -> TokenStream {
 /// rather than silently reading or writing the field unmapped. Supplying only
 /// `write = ...` is therefore fine for a struct that derives `WriteNetcdf`
 /// alone, and becomes an error as soon as `ReadNetcdf` is added.
+///
+/// # Unpacking: `scale_factor` and `add_offset`
+///
+/// Float fields are unpacked automatically. If the variable carries a
+/// `scale_factor` or `add_offset` attribute, the values read from the file are
+/// transformed by `value * scale_factor + add_offset` — the inverse of what
+/// [`WriteNetcdf`]'s `scale_offset` does — so a packed `short` variable arrives
+/// as the physical `f64` quantity it represents.
+///
+/// `#[netcdf(unpack(...))]` turns that off, on the container or on a single
+/// field. A bare `unpack` means both halves on, `unpack = false` means both off,
+/// and the nested form controls each independently. A field's setting replaces
+/// the container's wholesale, the same way `rename` replaces `rename_all`.
+///
+/// ```no_run
+/// use ggg_rs_derive::ReadNetcdf;
+///
+/// #[derive(ReadNetcdf)]
+/// #[netcdf(unpack(offset = false))]
+/// struct Data {
+///     // Scaled but not offset, inherited from the container.
+///     #[netcdf(dimensions("time"))]
+///     xco2: Vec<f64>,
+///
+///     // Exactly as stored in the file.
+///     #[netcdf(dimensions("time"), unpack = false)]
+///     raw_counts: Vec<f64>,
+///
+///     // Both halves, overriding the container.
+///     #[netcdf(dimensions("time"), unpack)]
+///     psurf: Vec<f64>,
+/// }
+/// ```
+///
+/// Unpacking only applies to `f32` and `f64` fields, because a fractional scale
+/// factor cannot be applied to an integer without truncating it. Integer fields
+/// are therefore passed through untouched, including under a container-level
+/// `unpack` — a struct is free to mix the two. Asking for it on a specific
+/// non-float field is a compile error, as is asking for it on a type alias the
+/// macro cannot see inside.
+///
+/// Unpacking happens *before* any `map(read = ...)`, so a map function receives
+/// physical values.
+///
+/// # Fill and missing values
+///
+/// A value matching the variable's fill value or its `missing_value` attribute
+/// is detected *before* scaling — `_FillValue` is stored in the packed
+/// representation, so once it has been multiplied by the scale factor it is
+/// indistinguishable from real data. `#[netcdf(on_fill = "...")]` chooses what
+/// happens to it, on the container or a single field:
+///
+/// | Value | Behaviour |
+/// |---|---|
+/// | `"nan"` (default) | replace with `NaN`, leaving it unscaled |
+/// | `"keep"` | leave the raw stored value in place, unscaled |
+/// | `"ignore"` | do not look for fill values; scale them like any other value |
+/// | `"error"` | fail, naming the variable and the index |
+///
+/// ```no_run
+/// use ggg_rs_derive::ReadNetcdf;
+///
+/// #[derive(ReadNetcdf)]
+/// #[netcdf(on_fill = "error")]
+/// struct Data {
+///     // A gap in this variable means the file is not usable.
+///     #[netcdf(dimensions("time"))]
+///     xco2: Vec<f64>,
+///
+///     // Here gaps are expected, so they become NaN.
+///     #[netcdf(dimensions("time"), on_fill = "nan")]
+///     psurf: Vec<f64>,
+/// }
+/// ```
+///
+/// Two details that will eventually surprise someone:
+///
+/// * **An undeclared fill value still counts.** The fill value comes from
+///   netCDF itself (`nc_inq_var_fill`), which reports the *type's default* —
+///   `-32767` for `short`, and so on — for any variable that never wrote a
+///   `_FillValue` attribute. Such values are masked. This matches
+///   netCDF4-python, whose auto-masking falls back to `default_fillvals` the
+///   same way. If a variable legitimately uses that value as data, set
+///   `on_fill = "ignore"` for the field.
+/// * **Byte variables are exempt from that fallback.** For an `i8`/`u8`
+///   variable, only an explicitly written `_FillValue` is honoured, following
+///   Unidata's advice that a byte range is too narrow to assume one of its
+///   values means "missing".
+///
+/// `missing_value` is read as an attribute and may list several sentinels.
+/// `valid_range`, `valid_min`, and `valid_max` are not yet honoured.
 #[proc_macro_derive(ReadNetcdf, attributes(netcdf))]
 pub fn derive_read_netcdf(input: TokenStream) -> TokenStream {
     read_netcdf::expand(input)

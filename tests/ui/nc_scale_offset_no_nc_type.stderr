@@ -1,0 +1,5 @@
+error: `scale_offset` needs `nc_type = "i16"` (or another numeric type) to say what the packed values are stored as
+ --> tests/ui/nc_scale_offset_no_nc_type.rs:7:34
+  |
+7 |     #[netcdf(dimensions("time"), scale_offset(scale = 0.01))]
+  |                                  ^^^^^^^^^^^^

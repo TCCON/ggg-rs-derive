@@ -1,0 +1,5 @@
+error: `unpack` requires an f32 or f64 element type, found `i16` — scale_factor and add_offset are only meaningful for floating-point data
+  --> tests/ui/nc_unpack_on_integer_field.rs:10:5
+   |
+10 |     flags: Vec<i16>,
+   |     ^^^^^

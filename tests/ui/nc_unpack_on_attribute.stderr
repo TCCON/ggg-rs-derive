@@ -1,0 +1,5 @@
+error: `unpack`/`on_fill` do not apply to an `attribute` field: scale_factor, add_offset, and _FillValue are variable attributes
+ --> tests/ui/nc_unpack_on_attribute.rs:8:5
+  |
+8 |     doi: f64,
+  |     ^^^

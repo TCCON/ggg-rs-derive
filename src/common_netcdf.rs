@@ -238,22 +238,32 @@ pub(crate) enum NcKind {
     Skip,
 }
 
-/// Pull the first generic argument `T` out of `Vec<T>` (used to distinguish
-/// `Vec<String>` from `Vec<f64>` during inference).
-pub(crate) fn vec_element_type(ty: &Type) -> Option<&Type> {
+/// Pull the first angle-bracketed type argument out of a path type, so
+/// `Vec<T>`, `Array2<T>`, and `Array<T, D>` all yield `T`. Returns `None` for
+/// types with no generic arguments and for anything that isn't a path.
+fn first_type_arg(ty: &Type) -> Option<&Type> {
     let Type::Path(type_path) = ty else {
         return None;
     };
     let seg = type_path.path.segments.last()?;
-    if seg.ident != "Vec" {
-        return None;
-    }
     if let syn::PathArguments::AngleBracketed(args) = &seg.arguments
         && let Some(syn::GenericArgument::Type(t)) = args.args.first()
     {
         return Some(t);
     }
     None
+}
+
+/// Pull the first generic argument `T` out of `Vec<T>` (used to distinguish
+/// `Vec<String>` from `Vec<f64>` during inference).
+pub(crate) fn vec_element_type(ty: &Type) -> Option<&Type> {
+    let Type::Path(type_path) = ty else {
+        return None;
+    };
+    if type_path.path.segments.last()?.ident != "Vec" {
+        return None;
+    }
+    first_type_arg(ty)
 }
 
 /// True if `ty` is `String`, `&str`, or `&String` — i.e. a scalar string.
@@ -314,6 +324,381 @@ pub(crate) fn infer_kind(ty: &Type) -> Result<NcKind, darling::Error> {
          #[netcdf(kind = \"values\"|\"array\"|\"string\")], #[netcdf(attribute)], \
          or #[netcdf(skip)]",
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Packing and unpacking (scale_factor / add_offset / fill values)
+// ---------------------------------------------------------------------------
+
+/// The Rust float type a field's elements are stored in. Packing and unpacking
+/// only apply to these two: the netCDF attribute conventions put the *packed*
+/// data in a byte or short variable and the unpacked data in a float or double,
+/// and scaling an integer field in place would truncate the scale factor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FloatTy {
+    F32,
+    F64,
+}
+
+impl FloatTy {
+    /// The type's name, for error messages and for naming the `__unpack_*` helper.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::F32 => "f32",
+            Self::F64 => "f64",
+        }
+    }
+
+    /// The identifier of the generated unpack helper for this type.
+    pub(crate) fn unpack_fn(self) -> syn::Ident {
+        syn::Ident::new(
+            match self {
+                Self::F32 => "__unpack_f32",
+                Self::F64 => "__unpack_f64",
+            },
+            proc_macro2::Span::call_site(),
+        )
+    }
+}
+
+/// Decide whether a field's elements are `f32` or `f64`.
+///
+/// Looks at the first generic argument for container types (`Vec<f64>`,
+/// `Array2<f32>`, `Array<f64, Ix2>`) and at the type itself for bare scalars.
+/// Deliberately conservative: a type alias such as `type Matrix = Array2<f32>`
+/// is opaque to the macro and yields `None`, which means "don't pack/unpack" by
+/// default and an error if the field explicitly asked for it.
+pub(crate) fn float_element_type(ty: &Type) -> Option<FloatTy> {
+    fn as_float(ty: &Type) -> Option<FloatTy> {
+        let Type::Path(p) = ty else {
+            return None;
+        };
+        // Reject qualified or multi-segment paths other than the bare names:
+        // `f64` is never written `std::f64` as a *type*.
+        let seg = p.path.segments.last()?;
+        if !seg.arguments.is_empty() {
+            return None;
+        }
+        match seg.ident.to_string().as_str() {
+            "f32" => Some(FloatTy::F32),
+            "f64" => Some(FloatTy::F64),
+            _ => None,
+        }
+    }
+
+    as_float(ty).or_else(|| first_type_arg(ty).and_then(as_float))
+}
+
+/// Render a type for an error message. `quote!` puts spaces around every token,
+/// so `Vec<f64>` would otherwise come out as `Vec < f64 >`.
+pub(crate) fn type_name(ty: &Type) -> String {
+    quote::quote!(#ty)
+        .to_string()
+        .replace(" <", "<")
+        .replace("< ", "<")
+        .replace(" >", ">")
+        .replace("> ", ">")
+        .replace(" ,", ",")
+        .replace(" ::", "::")
+        .replace(":: ", "::")
+}
+
+/// The name of a field's element type, but only when it is a primitive we
+/// recognize. Used to tell "this is an `i16`, which cannot be unpacked" apart
+/// from "this is a `Matrix`, and I have no idea what is inside it" — the advice
+/// for each is different.
+pub(crate) fn primitive_element_name(ty: &Type) -> Option<String> {
+    const PRIMITIVES: [&str; 15] = [
+        "i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "i128", "u128", "isize", "usize",
+        "f32", "f64", "bool",
+    ];
+    let candidate = first_type_arg(ty).unwrap_or(ty);
+    let Type::Path(p) = candidate else {
+        return None;
+    };
+    let seg = p.path.segments.last()?;
+    if !seg.arguments.is_empty() {
+        return None;
+    }
+    let name = seg.ident.to_string();
+    PRIMITIVES.contains(&name.as_str()).then_some(name)
+}
+
+/// The message explaining why a field cannot be packed or unpacked, tailored to
+/// whether its element type was recognizable. `attr` names the attribute being
+/// rejected so the same wording serves both derives.
+pub(crate) fn not_float_message(attr: &str, ty: &Type) -> String {
+    match primitive_element_name(ty) {
+        Some(found) => format!(
+            "`{attr}` requires an f32 or f64 element type, found `{found}` — scale_factor \
+             and add_offset are only meaningful for floating-point data"
+        ),
+        None => format!(
+            "`{attr}` requires an f32 or f64 element type, but the element type of `{}` \
+             could not be determined — a type alias is opaque to the macro. Use a concrete \
+             `Vec<f64>` or `Array<f64, _>`, or drop the annotation.",
+            type_name(ty)
+        ),
+    }
+}
+
+/// A netCDF storage type for packed data, named by `nc_type = "..."`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NcStorageType {
+    I8,
+    U8,
+    I16,
+    U16,
+    I32,
+    U32,
+    I64,
+    U64,
+    F32,
+    F64,
+}
+
+impl NcStorageType {
+    /// The Rust type to hand `add_variable::<T>` / collect the packed values into.
+    pub(crate) fn rust_ty(self) -> syn::Ident {
+        let name = match self {
+            Self::I8 => "i8",
+            Self::U8 => "u8",
+            Self::I16 => "i16",
+            Self::U16 => "u16",
+            Self::I32 => "i32",
+            Self::U32 => "u32",
+            Self::I64 => "i64",
+            Self::U64 => "u64",
+            Self::F32 => "f32",
+            Self::F64 => "f64",
+        };
+        syn::Ident::new(name, proc_macro2::Span::call_site())
+    }
+
+    pub(crate) fn name(self) -> String {
+        self.rust_ty().to_string()
+    }
+
+    /// True for the integer types, which are the ones that need rounding and a
+    /// range check when packing.
+    pub(crate) fn is_integer(self) -> bool {
+        !matches!(self, Self::F32 | Self::F64)
+    }
+}
+
+impl FromMeta for NcStorageType {
+    fn from_string(value: &str) -> darling::Result<Self> {
+        Ok(match value {
+            "i8" => Self::I8,
+            "u8" => Self::U8,
+            "i16" => Self::I16,
+            "u16" => Self::U16,
+            "i32" => Self::I32,
+            "u32" => Self::U32,
+            "i64" => Self::I64,
+            "u64" => Self::U64,
+            "f32" => Self::F32,
+            "f64" => Self::F64,
+            other => {
+                return Err(darling::Error::custom(format!(
+                    "unknown nc_type \"{other}\", expected one of \"i8\", \"u8\", \"i16\", \
+                     \"u16\", \"i32\", \"u32\", \"i64\", \"u64\", \"f32\", \"f64\""
+                )));
+            }
+        })
+    }
+}
+
+const SCALE_OFFSET_HELP: &str = "`scale_offset` needs at least one of `scale = ..` or \
+     `offset = ..`, plus the packed on-disk type, e.g. \
+     `scale_offset(scale = 0.01, offset = 400.0, nc_type = \"i16\")`";
+
+/// `#[netcdf(scale_offset(scale = .., offset = .., nc_type = ".."))]` on the
+/// write side: divide the field's values down into a smaller on-disk type and
+/// record the `scale_factor` / `add_offset` attributes so a reader can invert it.
+#[derive(Debug, Clone)]
+pub(crate) struct ScaleOffsetSpec {
+    pub(crate) scale: Option<f64>,
+    pub(crate) offset: Option<f64>,
+    pub(crate) nc_type: NcStorageType,
+}
+
+/// The body of a `scale_offset(...)`, parsed by darling. Split out so the outer
+/// `FromMeta` impl can reject the degenerate forms with a useful message.
+#[derive(FromMeta)]
+struct ScaleOffsetFields {
+    #[darling(default)]
+    scale: Option<f64>,
+    #[darling(default)]
+    offset: Option<f64>,
+    #[darling(default)]
+    nc_type: Option<NcStorageType>,
+}
+
+impl FromMeta for ScaleOffsetSpec {
+    fn from_list(items: &[NestedMeta]) -> darling::Result<Self> {
+        let fields = ScaleOffsetFields::from_list(items)?;
+        if fields.scale.is_none() && fields.offset.is_none() {
+            return Err(darling::Error::custom(SCALE_OFFSET_HELP));
+        }
+        // Required: without it the variable keeps the field's own float type and
+        // packing saves nothing, which is the only reason to pack.
+        let Some(nc_type) = fields.nc_type else {
+            return Err(darling::Error::custom(
+                "`scale_offset` needs `nc_type = \"i16\"` (or another numeric type) \
+                 to say what the packed values are stored as",
+            ));
+        };
+        Ok(Self {
+            scale: fields.scale,
+            offset: fields.offset,
+            nc_type,
+        })
+    }
+
+    fn from_word() -> darling::Result<Self> {
+        Err(darling::Error::custom(SCALE_OFFSET_HELP))
+    }
+
+    fn from_expr(_expr: &syn::Expr) -> darling::Result<Self> {
+        Err(darling::Error::custom(SCALE_OFFSET_HELP))
+    }
+}
+
+/// What to do with a value that matches the variable's fill or missing value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum OnFill {
+    /// Replace with `NaN`, leaving it unscaled. The default.
+    #[default]
+    Nan,
+    /// Leave the raw stored value in place, unscaled.
+    Keep,
+    /// Don't look for fill values at all; scale them like any other value.
+    Ignore,
+    /// Report an error naming the variable and index.
+    Error,
+}
+
+impl OnFill {
+    /// The variant of the generated `__OnFill` enum that corresponds to this.
+    pub(crate) fn variant(self) -> syn::Ident {
+        syn::Ident::new(
+            match self {
+                Self::Nan => "Nan",
+                Self::Keep => "Keep",
+                Self::Ignore => "Ignore",
+                Self::Error => "Error",
+            },
+            proc_macro2::Span::call_site(),
+        )
+    }
+}
+
+impl FromMeta for OnFill {
+    fn from_string(value: &str) -> darling::Result<Self> {
+        Ok(match value {
+            "nan" => Self::Nan,
+            "keep" => Self::Keep,
+            "ignore" => Self::Ignore,
+            "error" => Self::Error,
+            other => {
+                return Err(darling::Error::custom(format!(
+                    "unknown on_fill \"{other}\", expected \"nan\", \"keep\", \"ignore\", \
+                     or \"error\""
+                )));
+            }
+        })
+    }
+}
+
+/// `#[netcdf(unpack(...))]` on the read side. Both halves default to on, so the
+/// spec only ever records a deliberate choice.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct UnpackSpec {
+    pub(crate) scale: bool,
+    pub(crate) offset: bool,
+}
+
+/// The body of an `unpack(...)`, parsed by darling.
+#[derive(FromMeta)]
+struct UnpackFields {
+    #[darling(default)]
+    scale: Option<bool>,
+    #[darling(default)]
+    offset: Option<bool>,
+}
+
+impl FromMeta for UnpackSpec {
+    /// `unpack(scale = false)` — unlisted keys stay on.
+    fn from_list(items: &[NestedMeta]) -> darling::Result<Self> {
+        let fields = UnpackFields::from_list(items)?;
+        Ok(Self {
+            scale: fields.scale.unwrap_or(true),
+            offset: fields.offset.unwrap_or(true),
+        })
+    }
+
+    /// A bare `unpack` turns both on.
+    fn from_word() -> darling::Result<Self> {
+        Ok(Self {
+            scale: true,
+            offset: true,
+        })
+    }
+
+    /// `unpack = false` turns both off, `unpack = true` both on.
+    fn from_bool(value: bool) -> darling::Result<Self> {
+        Ok(Self {
+            scale: value,
+            offset: value,
+        })
+    }
+}
+
+/// The unpacking settings in force for one field, after combining the
+/// container-level default with the field's own override.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct UnpackFlags {
+    pub(crate) scale: bool,
+    pub(crate) offset: bool,
+    pub(crate) on_fill: OnFill,
+    /// True when *this field* asked for unpacking, as opposed to inheriting it
+    /// from the container. Only a field-level request makes a non-float element
+    /// type an error: a container-level `unpack` on a struct with a mix of float
+    /// and integer fields has to be allowed to pass the integers by.
+    pub(crate) explicit_field_optin: bool,
+}
+
+impl UnpackFlags {
+    /// True if anything at all needs doing: some scaling, or a fill check.
+    pub(crate) fn any(&self) -> bool {
+        self.scale || self.offset || self.on_fill != OnFill::Ignore
+    }
+}
+
+/// Combine container and field settings. The field's `unpack(...)` replaces the
+/// container's wholesale rather than merging key by key, matching how `rename`
+/// relates to `rename_all`. `on_fill` resolves the same way.
+pub(crate) fn resolve_unpack(
+    container_unpack: Option<&UnpackSpec>,
+    field_unpack: Option<&UnpackSpec>,
+    container_on_fill: Option<OnFill>,
+    field_on_fill: Option<OnFill>,
+) -> UnpackFlags {
+    let spec = field_unpack.or(container_unpack).copied().unwrap_or(
+        // Neither level said anything: unpack by default.
+        UnpackSpec {
+            scale: true,
+            offset: true,
+        },
+    );
+    UnpackFlags {
+        scale: spec.scale,
+        offset: spec.offset,
+        on_fill: field_on_fill.or(container_on_fill).unwrap_or_default(),
+        explicit_field_optin: field_unpack.is_some_and(|s| s.scale || s.offset)
+            || field_on_fill.is_some_and(|f| f != OnFill::Ignore),
+    }
 }
 
 /// A list of dimension names written as `#[netcdf(dimensions("time", "level"))]`.

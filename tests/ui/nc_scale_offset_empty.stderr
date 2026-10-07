@@ -1,0 +1,5 @@
+error: `scale_offset` needs at least one of `scale = ..` or `offset = ..`, plus the packed on-disk type, e.g. `scale_offset(scale = 0.01, offset = 400.0, nc_type = "i16")`
+ --> tests/ui/nc_scale_offset_empty.rs:7:34
+  |
+7 |     #[netcdf(dimensions("time"), scale_offset(nc_type = "i16"))]
+  |                                  ^^^^^^^^^^^^

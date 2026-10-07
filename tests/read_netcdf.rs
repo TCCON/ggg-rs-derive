@@ -226,3 +226,392 @@ fn test_check_dims() {
         assert!(false, "Got unexpected error type or no error");
     }
 }
+
+// ---------------------------------------------------------------------------
+// scale_factor / add_offset packing, and fill-value masking
+// ---------------------------------------------------------------------------
+
+/// Packs into an i16 on disk. 0.01 ppm resolution over a 400 ppm baseline, which
+/// is roughly how a real CO2 product would be stored.
+#[derive(Debug, ReadNetcdf, WriteNetcdf)]
+struct Packed {
+    #[netcdf(
+        dimensions("time"),
+        scale_offset(scale = 0.01, offset = 400.0, nc_type = "i16")
+    )]
+    xco2: Vec<f64>,
+}
+
+/// Reads the same file, but takes the stored values verbatim.
+#[derive(Debug, ReadNetcdf)]
+#[netcdf(unpack = false)]
+struct PackedRaw {
+    #[netcdf(dimensions("time"))]
+    xco2: Vec<f64>,
+}
+
+/// Reads the same file applying the scale but not the offset.
+#[derive(Debug, ReadNetcdf)]
+#[netcdf(unpack(offset = false))]
+struct PackedScaleOnly {
+    #[netcdf(dimensions("time"))]
+    xco2: Vec<f64>,
+}
+
+fn write_packed(path: &std::path::Path, data: &Packed) {
+    let mut file = netcdf::create(path).unwrap();
+    let mut root = file.root_mut().unwrap();
+    data.write_netcdf(&mut root).unwrap();
+}
+
+#[test]
+fn test_packed_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("packed.nc");
+    // Chosen so (v - 400) / 0.01 is an exact integer and the round trip is exact.
+    let data = Packed {
+        xco2: vec![400.0, 412.34, 387.5],
+    };
+    write_packed(&path, &data);
+
+    let file = netcdf::open(&path).unwrap();
+    let var = file.variable("xco2").unwrap();
+
+    // The on-disk type really is i16 — otherwise packing saved nothing and the
+    // round-trip assertion below would pass for the wrong reason.
+    assert_eq!(
+        var.vartype(),
+        netcdf::types::NcVariableType::Int(netcdf::types::IntType::I16)
+    );
+    // And the stored values really are packed.
+    assert_eq!(var.get_values::<i16, _>(..).unwrap(), vec![0, 1234, -1250]);
+    // The attributes a reader needs to invert it.
+    assert_eq!(
+        var.attribute("scale_factor").unwrap().value().unwrap(),
+        netcdf::AttributeValue::Double(0.01)
+    );
+    assert_eq!(
+        var.attribute("add_offset").unwrap().value().unwrap(),
+        netcdf::AttributeValue::Double(400.0)
+    );
+
+    let root = file.root().unwrap();
+    let read = Packed::read_netcdf(&root).unwrap();
+    for (want, got) in data.xco2.iter().zip(&read.xco2) {
+        assert!((want - got).abs() < 1e-9, "{want} != {got}");
+    }
+}
+
+#[test]
+fn test_unpack_disabled_reads_stored_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("packed.nc");
+    write_packed(
+        &path,
+        &Packed {
+            xco2: vec![400.0, 412.34, 387.5],
+        },
+    );
+
+    let file = netcdf::open(&path).unwrap();
+    let root = file.root().unwrap();
+    let raw = PackedRaw::read_netcdf(&root).unwrap();
+    assert_eq!(raw.xco2, vec![0.0, 1234.0, -1250.0]);
+}
+
+#[test]
+fn test_unpack_scale_without_offset() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("packed.nc");
+    write_packed(
+        &path,
+        &Packed {
+            xco2: vec![400.0, 412.34, 387.5],
+        },
+    );
+
+    let file = netcdf::open(&path).unwrap();
+    let root = file.root().unwrap();
+    let scaled = PackedScaleOnly::read_netcdf(&root).unwrap();
+    assert_eq!(scaled.xco2, vec![0.0, 12.34, -12.5]);
+}
+
+#[test]
+fn test_packing_out_of_range_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("overflow.nc");
+    // (1000 - 400) / 0.01 = 60000, past i16::MAX.
+    let data = Packed {
+        xco2: vec![400.0, 1000.0],
+    };
+    let mut file = netcdf::create(&path).unwrap();
+    let mut root = file.root_mut().unwrap();
+    let err = data
+        .write_netcdf(&mut root)
+        .expect_err("60000 does not fit in i16");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("xco2") && msg.contains("i16"),
+        "unexpected error message: {msg}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Fill and missing values
+// ---------------------------------------------------------------------------
+
+/// Build a file containing one packed variable of an arbitrary on-disk type,
+/// plus whatever attributes the caller wants. Lets the fill-value paths be
+/// tested against files this crate did not write.
+fn write_raw<T: netcdf::NcTypeDescriptor + Copy>(
+    path: &std::path::Path,
+    varname: &str,
+    values: &[T],
+    attrs: &[(&str, netcdf::AttributeValue)],
+) {
+    let mut file = netcdf::create(path).unwrap();
+    file.add_dimension("time", values.len()).unwrap();
+    let mut var = file.add_variable::<T>(varname, &["time"]).unwrap();
+    for (name, value) in attrs {
+        var.put_attribute(name, value.clone()).unwrap();
+    }
+    var.put_values(values, ..).unwrap();
+}
+
+fn scale_and_offset() -> Vec<(&'static str, netcdf::AttributeValue)> {
+    vec![
+        ("scale_factor", netcdf::AttributeValue::Double(0.01)),
+        ("add_offset", netcdf::AttributeValue::Double(400.0)),
+    ]
+}
+
+#[derive(Debug, ReadNetcdf)]
+struct Xco2Default {
+    #[netcdf(dimensions("time"))]
+    xco2: Vec<f64>,
+}
+
+#[derive(Debug, ReadNetcdf)]
+#[netcdf(on_fill = "keep")]
+struct Xco2Keep {
+    #[netcdf(dimensions("time"))]
+    xco2: Vec<f64>,
+}
+
+#[derive(Debug, ReadNetcdf)]
+#[netcdf(on_fill = "error")]
+struct Xco2Error {
+    // Only ever read back as an error, so the field itself goes unused.
+    #[allow(unused)]
+    #[netcdf(dimensions("time"))]
+    xco2: Vec<f64>,
+}
+
+#[derive(Debug, ReadNetcdf)]
+#[netcdf(on_fill = "ignore")]
+struct Xco2Ignore {
+    #[netcdf(dimensions("time"))]
+    xco2: Vec<f64>,
+}
+
+/// A declared `_FillValue` becomes NaN, and is not scaled on the way through.
+#[test]
+fn test_declared_fill_value_becomes_nan() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fill.nc");
+    let mut attrs = scale_and_offset();
+    attrs.push(("_FillValue", netcdf::AttributeValue::Short(-9999)));
+    write_raw(&path, "xco2", &[1234i16, -9999, -1250], &attrs);
+
+    let file = netcdf::open(&path).unwrap();
+    let root = file.root().unwrap();
+    let read = Xco2Default::read_netcdf(&root).unwrap();
+
+    assert!(read.xco2[1].is_nan(), "expected NaN, got {}", read.xco2[1]);
+    // Neighbours still scaled normally, so masking didn't disturb them.
+    assert_eq!(read.xco2[0], 412.34);
+    assert_eq!(read.xco2[2], 387.5);
+}
+
+/// netCDF reports a *default* fill value for variables that never declared one,
+/// and we honour it — matching netCDF4-python, whose `_toma` falls back to
+/// `default_fillvals`. This pins that behaviour, since it is the surprising one:
+/// -32767 is `NC_FILL_SHORT` and gets masked even though nothing declared it.
+#[test]
+fn test_undeclared_default_fill_is_masked() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("default_fill.nc");
+    write_raw(
+        &path,
+        "xco2",
+        &[1234i16, -32767, -1250],
+        &scale_and_offset(),
+    );
+
+    let file = netcdf::open(&path).unwrap();
+    let root = file.root().unwrap();
+    // Nothing wrote a _FillValue attribute...
+    assert!(
+        root.variable("xco2")
+            .unwrap()
+            .attribute("_FillValue")
+            .is_none()
+    );
+    // ...but NC_FILL_SHORT is still treated as fill.
+    let read = Xco2Default::read_netcdf(&root).unwrap();
+    assert!(read.xco2[1].is_nan(), "expected NaN, got {}", read.xco2[1]);
+    assert_eq!(read.xco2[0], 412.34);
+
+    // `on_fill = "ignore"` is the escape hatch: scale it like any other value.
+    let ignored = Xco2Ignore::read_netcdf(&root).unwrap();
+    assert_eq!(ignored.xco2[1], -32767.0 * 0.01 + 400.0);
+}
+
+#[derive(Debug, ReadNetcdf)]
+struct Flags {
+    #[netcdf(dimensions("time"))]
+    flags: Vec<f64>,
+}
+
+/// Byte variables are exempt from the default-fill assumption: the range is too
+/// narrow to spare a value, which is Unidata's stated advice. An explicit
+/// `_FillValue` is still honoured.
+#[test]
+fn test_byte_default_fill_is_exempt() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let undeclared = dir.path().join("byte_undeclared.nc");
+    write_raw(&undeclared, "flags", &[1i8, -127, 3], &[]);
+    let file = netcdf::open(&undeclared).unwrap();
+    let read = Flags::read_netcdf(&file.root().unwrap()).unwrap();
+    assert_eq!(
+        read.flags,
+        vec![1.0, -127.0, 3.0],
+        "NC_FILL_BYTE should not be assumed"
+    );
+
+    let declared = dir.path().join("byte_declared.nc");
+    write_raw(
+        &declared,
+        "flags",
+        &[1i8, -127, 3],
+        &[("_FillValue", netcdf::AttributeValue::Schar(-127))],
+    );
+    let file = netcdf::open(&declared).unwrap();
+    let read = Flags::read_netcdf(&file.root().unwrap()).unwrap();
+    assert!(read.flags[1].is_nan(), "declared _FillValue should mask");
+    assert_eq!(read.flags[0], 1.0);
+}
+
+#[test]
+fn test_missing_value_scalar_and_vector() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let scalar = dir.path().join("missing_scalar.nc");
+    let mut attrs = scale_and_offset();
+    attrs.push(("missing_value", netcdf::AttributeValue::Short(-1)));
+    write_raw(&scalar, "xco2", &[1234i16, -1, -1250], &attrs);
+    let file = netcdf::open(&scalar).unwrap();
+    let read = Xco2Default::read_netcdf(&file.root().unwrap()).unwrap();
+    assert!(read.xco2[1].is_nan());
+    assert_eq!(read.xco2[0], 412.34);
+
+    // `missing_value` is allowed to list several sentinels.
+    let vector = dir.path().join("missing_vector.nc");
+    let mut attrs = scale_and_offset();
+    attrs.push((
+        "missing_value",
+        netcdf::AttributeValue::Shorts(vec![-1, -2]),
+    ));
+    write_raw(&vector, "xco2", &[1234i16, -1, -2], &attrs);
+    let file = netcdf::open(&vector).unwrap();
+    let read = Xco2Default::read_netcdf(&file.root().unwrap()).unwrap();
+    assert!(read.xco2[1].is_nan() && read.xco2[2].is_nan());
+    assert_eq!(read.xco2[0], 412.34);
+}
+
+#[test]
+fn test_on_fill_keep_and_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fill.nc");
+    let mut attrs = scale_and_offset();
+    attrs.push(("_FillValue", netcdf::AttributeValue::Short(-9999)));
+    write_raw(&path, "xco2", &[1234i16, -9999, -1250], &attrs);
+
+    let file = netcdf::open(&path).unwrap();
+    let root = file.root().unwrap();
+
+    // "keep" leaves the raw stored value, deliberately unscaled.
+    let kept = Xco2Keep::read_netcdf(&root).unwrap();
+    assert_eq!(kept.xco2[1], -9999.0);
+    assert_eq!(kept.xco2[0], 412.34);
+
+    // "error" refuses the file, naming the variable and the index.
+    let err = Xco2Error::read_netcdf(&root).expect_err("fill value should be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("xco2") && msg.contains("index 1"),
+        "unexpected error message: {msg}"
+    );
+}
+
+/// A container-level `unpack` must not break integer fields: it is a default,
+/// and a struct mixing float and integer fields has to stay compilable. This is
+/// also the regression test for the old behaviour, where unpacking ran on every
+/// field and truncated a fractional scale factor to 0 for integer types.
+#[derive(Debug, ReadNetcdf, WriteNetcdf)]
+#[netcdf(unpack)]
+struct Mixed {
+    #[netcdf(dimensions("time"))]
+    xco2: Vec<f64>,
+    #[netcdf(dimensions("time"))]
+    quality: Vec<i32>,
+}
+
+#[test]
+fn test_container_unpack_leaves_integer_fields_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mixed.nc");
+    let data = Mixed {
+        xco2: vec![400.0, 401.5],
+        quality: vec![-7, 100],
+    };
+    {
+        let mut file = netcdf::create(&path).unwrap();
+        let mut root = file.root_mut().unwrap();
+        data.write_netcdf(&mut root).unwrap();
+    }
+
+    let file = netcdf::open(&path).unwrap();
+    let read = Mixed::read_netcdf(&file.root().unwrap()).unwrap();
+    assert_eq!(read.xco2, data.xco2);
+    assert_eq!(read.quality, data.quality);
+}
+
+/// A field's `unpack` replaces the container's wholesale rather than merging key
+/// by key — the same rule `rename` follows with respect to `rename_all`. Here the
+/// container disables the offset, and the field asks for both halves back.
+#[derive(Debug, ReadNetcdf)]
+#[netcdf(unpack(offset = false))]
+struct FieldOverridesContainer {
+    #[netcdf(dimensions("time"), unpack)]
+    xco2: Vec<f64>,
+}
+
+#[test]
+fn test_field_unpack_replaces_container_setting() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("packed.nc");
+    write_raw(&path, "xco2", &[1234i16, -1250], &scale_and_offset());
+
+    let file = netcdf::open(&path).unwrap();
+    let root = file.root().unwrap();
+
+    // The container alone would have given scale-only: [12.34, -12.5].
+    let scaled_only = PackedScaleOnly::read_netcdf(&root).unwrap();
+    assert_eq!(scaled_only.xco2, vec![12.34, -12.5]);
+
+    // The field override restores the offset too.
+    let both = FieldOverridesContainer::read_netcdf(&root).unwrap();
+    assert_eq!(both.xco2, vec![412.34, 387.5]);
+}

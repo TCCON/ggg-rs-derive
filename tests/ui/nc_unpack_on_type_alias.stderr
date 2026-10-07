@@ -1,0 +1,5 @@
+error: `unpack` requires an f32 or f64 element type, but the element type of `Matrix` could not be determined — a type alias is opaque to the macro. Use a concrete `Vec<f64>` or `Array<f64, _>`, or drop the annotation.
+  --> tests/ui/nc_unpack_on_type_alias.rs:10:5
+   |
+10 |     m: Matrix,
+   |     ^

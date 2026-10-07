@@ -1,0 +1,5 @@
+error: `scale_offset` requires an f32 or f64 element type, found `i32` — scale_factor and add_offset are only meaningful for floating-point data
+ --> tests/ui/nc_scale_offset_on_integer_field.rs:7:5
+  |
+7 |     counts: Vec<i32>,
+  |     ^^^^^^
