@@ -490,12 +490,14 @@ pub fn derive_write_netcdf(input: TokenStream) -> TokenStream {
 /// `#[netcdf(map(read = path::to::fn))]`: transforms the value after it is read.
 /// The function takes the value from the file and the struct field
 /// name, and returns a [`netcdf::Result`] containing the new type (which must
-/// match the structure field type): `fn(NcTy, &str) -> netcdf::Result<Out>`.
+/// match the structure field type): `fn(NcTy, &str, &netcdf::Variable<'_>) -> netcdf::Result<Out>`.
 /// Note that, unlike the corresponding functions for [`WriteNetcdf`], there is no
 /// `&Self` argument, because `read_netcdf` is still constructing `Self` when the
 /// function runs. Further, function is fallible: the data comes from a file this
 /// program did not necessarily write, so conversion could fail. The error type
-/// is that from the netcdf crate.
+/// is that from the netcdf crate. The variable instance is provided so that
+/// you can access other information about the data (e.g., attributes, dimensions)
+/// if needed.
 ///
 /// `#[netcdf(map_units(read = path::to::fn))]`: the given function will also
 /// variable's units. By default, the units are read from the "units" attribute,
@@ -503,10 +505,12 @@ pub fn derive_write_netcdf(input: TokenStream) -> TokenStream {
 /// `#[netcdf(map_units(read = path::to::fn, units_attr = "long_units"))]`.
 /// The signature of the function given to `read` is:
 ///
-/// `fn(NcTy, &str, Option<&str>) -> netcdf::Result<Out>`
+/// `fn(NcTy, &str, &netcdf::Variable<'_>, Option<&str>) -> netcdf::Result<Out>`
 ///
 /// where the `Option<&str>` will contain the units string if the attribute
 /// is present. If that attribute is not present, this will be `None`.
+/// This is a convenience to avoid needing boilerplate to get the units
+/// attribute from the variable instance in each `map_units` function.
 ///
 /// As with `WriteNetcdf`, `kind` is required whenever a mapping applies,
 /// since the type in the file no longer matches the field's declared type.
@@ -515,7 +519,7 @@ pub fn derive_write_netcdf(input: TokenStream) -> TokenStream {
 /// use ggg_rs_derive::ReadNetcdf;
 ///
 ///
-/// fn ppm_to_frac(values: Vec<f64>, name: &str, units: Option<&str>) -> netcdf::Result<Vec<f64>> {
+/// fn ppm_to_frac(values: Vec<f64>, name: &str, _var: &netcdf::Variable<'_>, units: Option<&str>) -> netcdf::Result<Vec<f64>> {
 ///     match units {
 ///         Some("ppm") => Ok(values.into_iter().map(|v| v / 1.0e6).collect()),
 ///         other => Err(netcdf::Error::Str(

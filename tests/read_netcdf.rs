@@ -12,7 +12,12 @@ fn frac_to_ppm<T>(_data: &T, values: &Vec<f64>, _name: &str) -> (Vec<f64>, Strin
 /// Read half of `map_units`: the inverse of [`frac_to_ppm`]. Reading is
 /// fallible, so unexpected units in the file are reported rather than silently
 /// producing wrong numbers.
-fn ppm_to_frac(values: Vec<f64>, name: &str, units: Option<&str>) -> netcdf::Result<Vec<f64>> {
+fn ppm_to_frac(
+    values: Vec<f64>,
+    name: &str,
+    _var: &netcdf::Variable<'_>,
+    units: Option<&str>,
+) -> netcdf::Result<Vec<f64>> {
     match units {
         Some("ppm") => Ok(values.into_iter().map(|v| v / 1.0e6).collect()),
         other => Err(netcdf::Error::Str(format!(

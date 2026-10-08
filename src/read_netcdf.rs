@@ -816,12 +816,18 @@ fn field_block(
     // Both are fallible, so their calls take a `?`.
     let remap = if let Some(map_fxn) = map_fns.map {
         quote! {
-            #map_fxn(__val, #fieldname_str)?
+            let __var = grp
+                .variable(#varname)
+                .ok_or_else(|| ::netcdf::Error::NotFound(format!("variable: '{}'", #varname)))?;
+            #map_fxn(__val, #fieldname_str, &__var)?
         }
     } else if let Some((map_fxn, unit_attr)) = map_fns.map_units {
         quote! {
+            let __var = grp
+                .variable(#varname)
+                .ok_or_else(|| ::netcdf::Error::NotFound(format!("variable: '{}'", #varname)))?;
             let __units = __get_units(grp, #varname, #unit_attr)?;
-            #map_fxn(__val, #fieldname_str, __units.as_deref())?
+            #map_fxn(__val, #fieldname_str, &__var, __units.as_deref())?
         }
     } else {
         quote!(__val)
